@@ -3,6 +3,7 @@ from functools import partial
 import numpy as np
 import os
 import scipy
+import tensorly
 
 
 def generate_basis_vectors_per_head(feat, threshold, num_heads, args, layer_id):
@@ -474,3 +475,65 @@ def decompose_llama_layer(layer, fp_inps, args, num_heads, layer_id, attention_m
     return basis_kq, eval_kq, basis_v, eval_v
 
 
+
+def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=None):
+    """
+    Thực hiện Tucker Decomposition trên Q, K, V của layer.
+    
+    Args:
+        ranks (list): List chứa rank mong muốn cho các chiều [Rank_Token, Rank_Head, Rank_HeadDim].
+                      Ví dụ: [4096, 16, 64] (Giữ nguyên Token, nén Head và Dim).
+    
+    Returns:
+        results (dict): Chứa core và factors cho từng loại Q, K, V.
+    """
+    # get calib features
+    tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
+    
+    # 1. Lấy dữ liệu Q, K, V dạng Tensor 3D: (Tokens, Heads, Head_Dim)
+    print(f"Shape of Q Tensor: {tensor_q.shape}") 
+    print(f"Shape of K Tensor: {tensor_k.shape}") 
+    print(f"Shape of V Tensor: {tensor_v.shape}") 
+    
+    results = {}
+    
+    # Hàm con để thực hiện Tucker trên 1 tensor
+    def run_tucker(tensor, name):
+        print(f"Decomposing {name} with Tucker, target ranks: {ranks}...")
+        X=torch.transpose(tensor.reshape(tensor.shape[0],num_heads,-1),0,1)
+        
+        tensor = tensor.to(torch.float32)
+        
+        core, factors = tensorly.tucker(tensor, rank=ranks, init='svd', tol=10e-5)
+        
+        # factors[0]: Ma trận liên quan đến chiều Token (Thường rất lớn, ít dùng để nén weight)
+        # factors[1]: Ma trận nén chiều Heads
+        # factors[2]: Ma trận nén chiều Head_Dim
+        return core, factors
+
+    if ranks is None:
+        r_token = tensor_k.shape[0] # Giữ nguyên chiều token
+        r_head = tensor_k.shape[1] // 2 
+        r_dim = tensor_k.shape[2] // 2
+        target_ranks = [r_token, r_head, r_dim]
+    else:
+        target_ranks = ranks
+
+    print(f"Using target ranks for Tucker Decomposition: {target_ranks}")
+    core_q, factors_q = run_tucker(tensor_q, "Query")
+    core_k, factors_k = run_tucker(tensor_k, "Key")
+    core_v, factors_v = run_tucker(tensor_v, "Value")
+
+    print(f"core_q shape: {core_q.shape}, core_k shape: {core_k.shape}, core_v shape: {core_v.shape}")
+    print(f"factors_q shapes: {[f.shape for f in factors_q]}")
+    print(f"factors_k shapes: {[f.shape for f in factors_k]}")
+    print(f"factors_v shapes: {[f.shape for f in factors_v]}")
+
+
+    results = {
+        "Q": {"core": core_q, "factors": factors_q},
+        "K": {"core": core_k, "factors": factors_k},
+        "V": {"core": core_v, "factors": factors_v}
+    }
+    
+    return results

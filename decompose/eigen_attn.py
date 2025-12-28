@@ -3,7 +3,7 @@ import torch.nn as nn
 import copy
 import gc
 
-from decompose.eigen_attn_utils import decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer
+from decompose.eigen_attn_utils import decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer, tucker_decompose_opt_layer
 from models.decompose_modules import OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer
 
 
@@ -139,7 +139,9 @@ def eigenattn(
                     args.eigen_attn_params['threshold'] = 0.98
                     error = 0.0
                     num_heads = lm.model.config.num_attention_heads
-                    basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
+                    # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
+                    tucker = tucker_decompose_opt_layer(layer, inps, args, num_heads, i)
+                    return tucker
                     
 
                     rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
