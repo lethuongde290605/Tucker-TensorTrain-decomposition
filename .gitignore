@@ -15,3 +15,4 @@ huggingface/
 log/
 temp.sh
 HF_cache/
+eigen_env/
