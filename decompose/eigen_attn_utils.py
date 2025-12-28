@@ -4,6 +4,7 @@ import numpy as np
 import os
 import scipy
 import tensorly
+tensorly.set_backend('pytorch')
 
 
 def generate_basis_vectors_per_head(feat, threshold, num_heads, args, layer_id):
@@ -475,60 +476,57 @@ def decompose_llama_layer(layer, fp_inps, args, num_heads, layer_id, attention_m
     return basis_kq, eval_kq, basis_v, eval_v
 
 
-
 def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=None):
-    """
-    Thực hiện Tucker Decomposition trên Q, K, V của layer.
     
-    Args:
-        ranks (list): List chứa rank mong muốn cho các chiều [Rank_Token, Rank_Head, Rank_HeadDim].
-                      Ví dụ: [4096, 16, 64] (Giữ nguyên Token, nén Head và Dim).
-    
-    Returns:
-        results (dict): Chứa core và factors cho từng loại Q, K, V.
-    """
-    # get calib features
+    # shape = (nsamples / avg_dim, sq_len = 2048, dim = 768)
     tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
+    print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}") 
+
+    head_dim = tensor_q.shape[-1] // num_heads # 768 / 12 = 64
     
-    # 1. Lấy dữ liệu Q, K, V dạng Tensor 3D: (Tokens, Heads, Head_Dim)
-    print(f"Shape of Q Tensor: {tensor_q.shape}") 
-    print(f"Shape of K Tensor: {tensor_k.shape}") 
-    print(f"Shape of V Tensor: {tensor_v.shape}") 
     
-    results = {}
+    def prepare_tensor(t):
+        # [32, 2048, 768] -> [32, 2048, 12, 64]
+        t = t.view(t.shape[0], t.shape[1], num_heads, head_dim)
+        # keep batch_size and seq_len: [65536, 12, 64]
+        t = t.view(-1, num_heads, head_dim)
+        return t
+
+    tensor_q = prepare_tensor(tensor_q)
+    tensor_k = prepare_tensor(tensor_k)
+    tensor_v = prepare_tensor(tensor_v)
     
-    # Hàm con để thực hiện Tucker trên 1 tensor
-    def run_tucker(tensor, name):
-        print(f"Decomposing {name} with Tucker, target ranks: {ranks}...")
-        X=torch.transpose(tensor.reshape(tensor.shape[0],num_heads,-1),0,1)
-        
-        tensor = tensor.to(torch.float32)
-        
-        core, factors = tensorly.tucker(tensor, rank=ranks, init='svd', tol=10e-5)
-        
-        # factors[0]: Ma trận liên quan đến chiều Token (Thường rất lớn, ít dùng để nén weight)
-        # factors[1]: Ma trận nén chiều Heads
-        # factors[2]: Ma trận nén chiều Head_Dim
-        return core, factors
+    print(f"Reshaped for Tucker - Q: {tensor_q.shape}") 
 
     if ranks is None:
-        r_token = tensor_k.shape[0] # Giữ nguyên chiều token
-        r_head = tensor_k.shape[1] // 2 
-        r_dim = tensor_k.shape[2] // 2
+        r_token = tensor_q.shape[0] 
+        r_head = tensor_q.shape[1] * 2 // 3
+        r_dim = tensor_q.shape[2] // 2 
+        
         target_ranks = [r_token, r_head, r_dim]
     else:
         target_ranks = ranks
 
-    print(f"Using target ranks for Tucker Decomposition: {target_ranks}")
-    core_q, factors_q = run_tucker(tensor_q, "Query")
-    core_k, factors_k = run_tucker(tensor_k, "Key")
-    core_v, factors_v = run_tucker(tensor_v, "Value")
+    print(f"Target Ranks: {target_ranks}")
 
-    print(f"core_q shape: {core_q.shape}, core_k shape: {core_k.shape}, core_v shape: {core_v.shape}")
-    print(f"factors_q shapes: {[f.shape for f in factors_q]}")
-    print(f"factors_k shapes: {[f.shape for f in factors_k]}")
-    print(f"factors_v shapes: {[f.shape for f in factors_v]}")
+    results = {}
+    
+    def run_tucker(tensor, name, target_ranks):
+        print(f"Decomposing {name}...")
+        
+        # tensorly only support for float32
+        tensor = tensor.to(torch.float32)
+        
+        with torch.cuda.amp.autocast(enabled=False):
+            core, factors = tensorly.decomposition.tucker(tensor, rank=target_ranks, init='svd', tol=10e-5)
+        
+        return core, factors
 
+    core_q, factors_q = run_tucker(tensor_q, "Query", target_ranks)
+    core_k, factors_k = run_tucker(tensor_k, "Key", target_ranks)
+    core_v, factors_v = run_tucker(tensor_v, "Value", target_ranks)
+
+    print(f"Factors Q shapes: {[f.shape for f in factors_q]}")
 
     results = {
         "Q": {"core": core_q, "factors": factors_q},
