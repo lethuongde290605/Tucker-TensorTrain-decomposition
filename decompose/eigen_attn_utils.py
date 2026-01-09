@@ -4,6 +4,7 @@ import numpy as np
 import os
 import scipy
 import tensorly
+from tensorly.decomposition import matrix_product_state
 tensorly.set_backend('pytorch')
 
 
@@ -525,6 +526,60 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=
     core_q, factors_q = run_tucker(tensor_q, "Query", target_ranks)
     core_k, factors_k = run_tucker(tensor_k, "Key", target_ranks)
     core_v, factors_v = run_tucker(tensor_v, "Value", target_ranks)
+
+    print(f"Factors Q shapes: {[f.shape for f in factors_q]}")
+
+    results = {
+        "Q": {"core": core_q, "factors": factors_q},
+        "K": {"core": core_k, "factors": factors_k},
+        "V": {"core": core_v, "factors": factors_v}
+    }
+    
+    return results
+
+def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=None):
+
+    tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
+    print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}") 
+
+    def prepare_tensor(t):
+        t = t.view(t.shape[0], t.shape[1], num_heads, head_dim)
+        t = t.view(-1, num_heads, head_dim)
+        return t
+
+    tensor_q = prepare_tensor(tensor_q)
+    tensor_k = prepare_tensor(tensor_k)
+    tensor_v = prepare_tensor(tensor_v)
+
+    print(f"Reshaped for Tucker - Q: {tensor_q.shape}") 
+
+    if ranks is None:
+        r_token = tensor_q.shape[0] 
+        r_head = tensor_q.shape[1] * 2 // 3
+        r_dim = tensor_q.shape[2] // 2 
+        
+        target_ranks = [r_token, r_head, r_dim]
+    else:
+        target_ranks = ranks
+
+    print(f"Target Ranks: {target_ranks}")
+
+    results = {}
+    
+    def run_tensor_train(tensor, name, target_ranks):
+        print(f"Decomposing {name}...")
+        
+        # tensorly only support for float32
+        tensor = tensor.to(torch.float32)
+        
+        with torch.cuda.amp.autocast(enabled=False):
+            core, factors = matrix_product_state(tensor, rank=target_ranks, init='svd', tol=10e-5)
+        
+        return core, factors
+
+    core_q, factors_q = run_tensor_train(tensor_q, "Query", target_ranks)
+    core_k, factors_k = run_tensor_train(tensor_k, "Key", target_ranks)
+    core_v, factors_v = run_tensor_train(tensor_v, "Value", target_ranks)
 
     print(f"Factors Q shapes: {[f.shape for f in factors_q]}")
 

@@ -140,9 +140,11 @@ def eigenattn(
                     error = 0.0
                     num_heads = lm.model.config.num_attention_heads
                     # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
-                    tucker = tucker_decompose_opt_layer(layer, inps, args, num_heads, i)
-                    return tucker
+                    # tucker = tucker_decompose_opt_layer(layer, inps, args, num_heads, i)
+                    # return tucker
                     
+                    tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i)
+                    return tensor_train
 
                     rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
                     rank_v = num_heads * torch.amax((torch.cumsum(eval_v, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
