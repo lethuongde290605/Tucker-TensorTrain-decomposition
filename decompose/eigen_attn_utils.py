@@ -538,55 +538,105 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=
     return results
 
 def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=None):
-
-    tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
-    print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}") 
-
+    # Input: W_q, W_k, W_v 
+    w_q = layer.self_attn.q_proj.weight.data  # shape: (hidden_dim, hidden_dim) = (768, 768)
+    w_k = layer.self_attn.k_proj.weight.data 
+    w_v = layer.self_attn.v_proj.weight.data
+    print(f"Original Shape - Q: {w_q.shape}, K: {w_k.shape}, V: {w_v.shape}") 
+    print(f"Q: {w_q}")
+    
+    # Ta tách hidden_dim 768 = 4x4x4x4x3
+    # Reshape (768, 768) -> (16, 16, 16, 16, 9) theo TT-matrix format
     def prepare_tensor(t):
-        t = t.view(t.shape[0], t.shape[1], num_heads, head_dim)
-        t = t.view(-1, num_heads, head_dim)
+        # (768, 768) -> (4, 4, 4, 4, 3, 4, 4, 4, 4, 3)
+        t = t.view(4, 4, 4, 4, 3, 4, 4, 4, 4, 3)
+        # Interleave row/col factors: (0,5), (1,6), (2,7), (3,8), (4,9)
+        t = t.permute(0, 5, 1, 6, 2, 7, 3, 8, 4, 9)
+        # Reshape to combine pairs: (4*4, 4*4, 4*4, 4*4, 3*3) = (16, 16, 16, 16, 9)
+        t = t.reshape(16, 16, 16, 16, 9)
         return t
 
-    tensor_q = prepare_tensor(tensor_q)
-    tensor_k = prepare_tensor(tensor_k)
-    tensor_v = prepare_tensor(tensor_v)
-
-    print(f"Reshaped for Tucker - Q: {tensor_q.shape}") 
-
+    w_q = prepare_tensor(w_q)
+    w_k = prepare_tensor(w_k)
+    w_v = prepare_tensor(w_v)
+    print(f"Reshaped for TensorTrain - Q: {w_q.shape}")  # Expected: (16, 16, 16, 16, 9)
+    print(f"Q after reshape: {w_q}")
+    # Tensor 5 chiều => List rank cần 6 phần tử: [1, r1, r2, r3, r4, 1]
     if ranks is None:
-        r_token = tensor_q.shape[0] 
-        r_head = tensor_q.shape[1] * 2 // 3
-        r_dim = tensor_q.shape[2] // 2 
+        # Đặt rank mặc định dựa trên kích thước dimensions
+        r1 = min(w_q.shape[0], w_q.shape[1])  # min(16, 16) = 16
+        r2 = min(w_q.shape[1], w_q.shape[2])  # min(16, 16) = 16
+        r3 = min(w_q.shape[2], w_q.shape[3])  # min(16, 16) = 16
+        r4 = min(w_q.shape[3], w_q.shape[4])  # min(16, 9) = 9
+        target_ranks = [1, r1, r2, r3, r4, 1]
         
-        target_ranks = [r_token, r_head, r_dim]
-    else:
-        target_ranks = ranks
+    elif isinstance(ranks, int):
+        # Nếu truyền 1 số nguyên => dùng chung cho các rank ở giữa
+        target_ranks = [1, ranks, ranks, ranks, ranks, 1]
+        
+    elif isinstance(ranks, list):
+        if len(ranks) == 4:
+            # Nếu truyền list [r1, r2, r3, r4] => thêm 1 vào đầu và cuối
+            target_ranks = [1] + ranks + [1]
+        elif len(ranks) == 6:
+            # Nếu đã truyền đủ
+            target_ranks = ranks
+        else:
+            raise ValueError("Với Tensor 5 chiều, ranks phải là list 4 hoặc 6 phần tử.")
 
-    print(f"Target Ranks: {target_ranks}")
+    print(f"Target Ranks (TT-Ranks): {target_ranks}")
 
-    results = {}
-    
     def run_tensor_train(tensor, name, target_ranks):
-        print(f"Decomposing {name}...")
+        print(f"Decomposing {name} with shape {tensor.shape}...")
         
-        # tensorly only support for float32
         tensor = tensor.to(torch.float32)
         
         with torch.cuda.amp.autocast(enabled=False):
-            core, factors = matrix_product_state(tensor, rank=target_ranks, init='svd', tol=10e-5)
+            tt_tensor = tensor_train(tensor, rank=target_ranks, verbose=False)
         
-        return core, factors
+        # Lấy danh sách các factors
+        # Factors sẽ gồm 3 tensor con:
+        # F1: (1, rows, r1)
+        # F2: (r1, heads, r2)
+        # F3: (r2, dim, 1)
+        factors = tt_tensor.factors 
+        
+        return factors
 
-    core_q, factors_q = run_tensor_train(tensor_q, "Query", target_ranks)
-    core_k, factors_k = run_tensor_train(tensor_k, "Key", target_ranks)
-    core_v, factors_v = run_tensor_train(tensor_v, "Value", target_ranks)
+    # Thực hiện phân rã
+    factors_q = run_tensor_train(w_q, "Query", target_ranks)
+    factors_k = run_tensor_train(w_k, "Key", target_ranks)
+    factors_v = run_tensor_train(w_v, "Value", target_ranks)
 
-    print(f"Factors Q shapes: {[f.shape for f in factors_q]}")
+    print(f"Factors Q shapes (before reshape): {[f.shape for f in factors_q]}")
+
+    # Reshape factors từ (r1, m*n, r2) -> (m, r1, n, r2)
+    # Với tensor 5D (16, 16, 16, 16, 9), mỗi chiều = m*n trong đó m=n=4 hoặc m=n=3
+    # Các chiều: 16=4*4, 16=4*4, 16=4*4, 16=4*4, 9=3*3
+    dim_factors = [(4, 4), (4, 4), (4, 4), (4, 4), (3, 3)]  # (m, n) cho mỗi chiều
+    
+    def reshape_factors(factors):
+        reshaped = []
+        for i, f in enumerate(factors):
+            # f có shape (r1, m*n, r2)
+            r1, mn, r2 = f.shape
+            m, n = dim_factors[i]
+            # Reshape (r1, m*n, r2) -> (r1, m, n, r2) -> (m, r1, n, r2)
+            f = f.view(r1, m, n, r2)
+            f = f.permute(1, 0, 2, 3)  # (m, r1, n, r2)
+            reshaped.append(f)
+        return reshaped
+    
+    factors_q = reshape_factors(factors_q)
+    factors_k = reshape_factors(factors_k)
+    factors_v = reshape_factors(factors_v)
+
+    print(f"Factors Q shapes (after reshape): {[f.shape for f in factors_q]}")
 
     results = {
-        "Q": {"core": core_q, "factors": factors_q},
-        "K": {"core": core_k, "factors": factors_k},
-        "V": {"core": core_v, "factors": factors_v}
+        "Q": {"factors": factors_q},
+        "K": {"factors": factors_k},
+        "V": {"factors": factors_v}
     }
     
     return results
