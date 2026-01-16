@@ -502,7 +502,7 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=
     print(f"Reshaped for Tucker - Q: {tensor_q.shape}") 
 
     if ranks is None:
-        target_ranks = [tensor_q.shape[0]//2, 2, 2, 2, 2, 2]
+        target_ranks = [tensor_q.shape[0], 2, 2, 2, 2, 2]
     else:
         target_ranks = ranks
 
@@ -517,13 +517,13 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=
         tensor = tensor.to(torch.float32)
         
         with torch.cuda.amp.autocast(enabled=False):
-            core0, factors0 = tensorly.decomposition.tucker(tensor, rank=target_ranks, init='svd')
-            core, factors = tensorly.decomposition.tucker(
-                tensor,
-                rank=target_ranks,
-                init=(core0, factors0),   
-                fixed_factors=[0], 
-            )
+            core, factors = tensorly.decomposition.tucker(tensor, rank=target_ranks, init='svd')
+            # core, factors = tensorly.decomposition.tucker(
+            #     tensor,
+            #     rank=target_ranks,
+            #     init=(core0, factors0),   
+            #     fixed_factors=[0], 
+            # )
 
         
         return core, factors
