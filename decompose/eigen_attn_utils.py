@@ -502,7 +502,7 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=
     print(f"Reshaped for Tucker - Q: {tensor_q.shape}") 
 
     if ranks is None:
-        target_ranks = [tensor_q.shape[0], 2, 2, 2, 2, 2]
+        target_ranks = [tensor_q.shape[0]//2, 2, 2, 2, 2, 2]
     else:
         target_ranks = ranks
 
