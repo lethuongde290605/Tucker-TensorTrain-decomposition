@@ -4,7 +4,7 @@ import numpy as np
 import os
 import scipy
 import tensorly
-from tensorly.decomposition import matrix_product_state
+from tensorly.decomposition import tensor_train
 tensorly.set_backend('pytorch')
 
 

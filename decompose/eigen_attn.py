@@ -3,7 +3,7 @@ import torch.nn as nn
 import copy
 import gc
 
-from decompose.eigen_attn_utils import decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer, tucker_decompose_opt_layer
+from decompose.eigen_attn_utils import decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer, tucker_decompose_opt_layer, tensor_train_decompose_opt_layer
 from models.decompose_modules import OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer
 
 
