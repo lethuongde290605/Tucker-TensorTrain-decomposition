@@ -1,69 +1,3 @@
-'''
-import tensorly as tl
-import torch
-tl.set_backend('pytorch')
-import time
-
-tensor = torch.randn(8, 6, 4)  # Example tensor
-ranks = [4, 3, 2]  # Desired ranks for each mode
-fixed_factors = [0]
-
-time0 = time.time()
-core0, factors0 = tl.decomposition.tucker(tensor, rank=ranks, init='svd')
-core, factors = tl.decomposition.tucker(
-    tensor,
-    rank=ranks,
-    fixed_factors=fixed_factors,
-    init=(core0, factors0)
-)
-time1 = time.time()
-print(f"Tucker decomposition took {time1 - time0:.4f} seconds")
-
-
-
-print("Core tensor shape:", core.shape)
-for i, factor in enumerate(factors):
-    print(f"Factor matrix for mode {i} shape:", factor.shape)
-
-
-restore_tensor = tl.tucker_to_tensor((core, factors))
-
-print("Restored tensor shape:", restore_tensor.shape)
-
-loss = tl.norm(tensor - restore_tensor, 2)
-print("Reconstruction loss (Frobenius norm):", loss.item())
-
-
-print("\n--- Another Example ---\n")
-
-ranks = [8, 3, 2]  # Desired ranks for each mode
-fixed_factors = [0]
-
-time0 = time.time()
-core0, factors0 = tl.decomposition.tucker(tensor, rank=ranks, init='svd')
-core, factors = tl.decomposition.tucker(
-    tensor,
-    rank=ranks,
-    fixed_factors=fixed_factors,
-    init=(core0, factors0)
-)
-time1 = time.time()
-
-print(f"Tucker decomposition took {time1 - time0:.4f} seconds")
-
-print("Core tensor shape:", core.shape)
-for i, factor in enumerate(factors):
-    print(f"Factor matrix for mode {i} shape:", factor.shape)
-
-
-restore_tensor = tl.tucker_to_tensor((core, factors))
-
-print("Restored tensor shape:", restore_tensor.shape)
-
-loss = tl.norm(tensor - restore_tensor, 2)
-print("Reconstruction loss (Frobenius norm):", loss.item())
-'''
-
 import tensorly as tl
 import torch
 tl.set_backend('pytorch')
@@ -134,15 +68,13 @@ def tucker_reconstruct(core, factors, original_shape):
     Returns:
         Reconstructed tensor with the original shape.
     """
-    # Step 1: Reconstruct the prepared tensor from Tucker components
-    reconstructed = tl.tucker_to_tensor((core, factors))
     # reconstructed shape: (batch, 4, 4, 4, 4, 3)
+    reconstructed = tl.tucker_to_tensor((core, factors))
 
-    # Step 2: Reverse prepare_tensor — collapse the factored dims back to DIM
     # (batch, 4, 4, 4, 4, 3) -> (batch, 768)
     reconstructed = reconstructed.reshape(reconstructed.shape[0], -1)
 
-    # Step 3: Reshape back to (nsamples, seq_len, dim)
+    # Reshape back to (nsamples, seq_len, dim)
     nsamples, seq_len, dim = original_shape
     reconstructed = reconstructed.view(nsamples, seq_len, dim)
 
@@ -165,6 +97,8 @@ def test_tucker_roundtrip():
     torch.manual_seed(42)
     tensor = torch.randn(*original_shape)
 
+    print("orignial value: ", tensor[0]) 
+
     # Decompose 
     t0 = time.time()
     core, factors = tucker_decompose(tensor)
@@ -176,6 +110,8 @@ def test_tucker_roundtrip():
     reconstructed = tucker_reconstruct(core, factors, original_shape)
     t3 = time.time()
     print(f"Reconstruction took       {t3 - t2:.4f} s")
+
+    print("reconstructed value: ", reconstructed[0]) 
 
     # Error metrics 
     diff = tensor - reconstructed
