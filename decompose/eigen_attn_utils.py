@@ -5,6 +5,7 @@ import os
 import scipy
 import tensorly
 from tensorly.decomposition import tensor_train
+from tensorly.tt_tensor import tt_to_tensor
 tensorly.set_backend('pytorch')
 
 
@@ -549,7 +550,6 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     w_k = layer.self_attn.k_proj.weight.data 
     w_v = layer.self_attn.v_proj.weight.data
     print(f"Original Shape - Q: {w_q.shape}, K: {w_k.shape}, V: {w_v.shape}") 
-    print(f"Q: {w_q}")
     
     # Ta tách hidden_dim 768 = 4x4x4x4x3
     # Reshape (768, 768) -> (16, 16, 16, 16, 9) theo TT-matrix format
@@ -566,15 +566,23 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     w_k = prepare_tensor(w_k)
     w_v = prepare_tensor(w_v)
     print(f"Reshaped for TensorTrain - Q: {w_q.shape}")  # Expected: (16, 16, 16, 16, 9)
-    print(f"Q after reshape: {w_q}")
     # Tensor 5 chiều => List rank cần 6 phần tử: [1, r1, r2, r3, r4, 1]
     if ranks is None:
-        # Đặt rank mặc định dựa trên kích thước dimensions
-        r1 = min(w_q.shape[0], w_q.shape[1])  # min(16, 16) = 16
-        r2 = min(w_q.shape[1], w_q.shape[2])  # min(16, 16) = 16
-        r3 = min(w_q.shape[2], w_q.shape[3])  # min(16, 16) = 16
-        r4 = min(w_q.shape[3], w_q.shape[4])  # min(16, 9) = 9
-        target_ranks = [1, r1, r2, r3, r4, 1]
+        # Tính TT-rank tối đa (exact decomposition): r_i = min(∏ dims[:i+1], ∏ dims[i+1:])
+        dims = list(w_q.shape)  # [16, 16, 16, 16, 9]
+        n = len(dims)
+        tt_ranks = [1]
+        for i in range(1, n):
+            left = 1
+            for d in dims[:i]:
+                left *= d
+            right = 1
+            for d in dims[i:]:
+                right *= d
+            tt_ranks.append(min(left, right))
+        tt_ranks.append(1)
+        # Kết quả: [1, 16, 256, 144, 9, 1]
+        target_ranks = tt_ranks
         
     elif isinstance(ranks, int):
         # Nếu truyền 1 số nguyên => dùng chung cho các rank ở giữa
@@ -599,12 +607,7 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
         
         with torch.cuda.amp.autocast(enabled=False):
             tt_tensor = tensor_train(tensor, rank=target_ranks, verbose=False)
-        
-        # Lấy danh sách các factors
-        # Factors sẽ gồm 3 tensor con:
-        # F1: (1, rows, r1)
-        # F2: (r1, heads, r2)
-        # F3: (r2, dim, 1)
+    
         factors = tt_tensor.factors 
         
         return factors
@@ -646,3 +649,65 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     }
     
     return results
+
+def check_error_tensor_train_opt(layer, fp_inps, args, num_heads, layer_id, ranks=None):
+    
+    # Original weights
+    w_q = layer.self_attn.q_proj.weight.data 
+    w_k = layer.self_attn.k_proj.weight.data 
+    w_v = layer.self_attn.v_proj.weight.data
+
+    # TensorTrain decomposition
+    tt_results = tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks)
+
+    dim_factors = [(4, 4), (4, 4), (4, 4), (4, 4), (3, 3)]
+
+    # Đảo ngược reshape_factors về lại (r1, m*n, r2)
+    def reverse_reshape_factors(factors):
+        reversed_factors = []
+        for i, f in enumerate(factors):
+            # f hiện có shape (m, r1, n, r2)
+            m, r1, n, r2 = f.shape
+            # Đảo ngược permute: (m, r1, n, r2) → (r1, m, n, r2)
+            f = f.permute(1, 0, 2, 3)
+            # Đảo ngược view: (r1, m, n, r2) → (r1, m*n, r2)
+            f = f.reshape(r1, m * n, r2)
+            reversed_factors.append(f)
+        return reversed_factors
+
+    # Đảo ngược prepare_tensor từ (16,16,16,16,9) về (768, 768)
+    def reverse_prepare_tensor(t):
+        # (16,16,16,16,9) → (4,4, 4,4, 4,4, 4,4, 3,3)
+        t = t.view(4, 4, 4, 4, 4, 4, 4, 4, 3, 3)
+        # Đảo ngược permute(0,5,1,6,2,7,3,8,4,9)
+        # Inverse permutation: (0,2,4,6,8, 1,3,5,7,9)
+        t = t.permute(0, 2, 4, 6, 8, 1, 3, 5, 7, 9)
+        # (4,4,4,4,3, 4,4,4,4,3) → (768, 768)
+        t = t.reshape(768, 768)
+        return t
+
+    # Reconstruct Q
+    factors_q_tt = reverse_reshape_factors(tt_results["Q"]["factors"])
+    w_q_reconstructed = reverse_prepare_tensor(tt_to_tensor(factors_q_tt))
+
+    # Reconstruct K
+    factors_k_tt = reverse_reshape_factors(tt_results["K"]["factors"])
+    w_k_reconstructed = reverse_prepare_tensor(tt_to_tensor(factors_k_tt))
+
+    # Reconstruct V
+    factors_v_tt = reverse_reshape_factors(tt_results["V"]["factors"])
+    w_v_reconstructed = reverse_prepare_tensor(tt_to_tensor(factors_v_tt))
+
+    # Tính relative error
+    error_q = torch.norm(w_q.float() - w_q_reconstructed) / torch.norm(w_q.float())
+    error_k = torch.norm(w_k.float() - w_k_reconstructed) / torch.norm(w_k.float())
+    error_v = torch.norm(w_v.float() - w_v_reconstructed) / torch.norm(w_v.float())
+
+    print(f"Relative Error - Q: {error_q.item():.6f}, K: {error_k.item():.6f}, V: {error_v.item():.6f}")
+
+    return {
+        "error_q": error_q.item(),
+        "error_k": error_k.item(),
+        "error_v": error_v.item(),
+    }
+

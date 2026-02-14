@@ -3,7 +3,7 @@ import torch.nn as nn
 import copy
 import gc
 
-from decompose.eigen_attn_utils import decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer, tucker_decompose_opt_layer, tensor_train_decompose_opt_layer
+from decompose.eigen_attn_utils import decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer, tucker_decompose_opt_layer, tensor_train_decompose_opt_layer, check_error_tensor_train_opt
 from models.decompose_modules import OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer
 
 
@@ -143,7 +143,8 @@ def eigenattn(
                     tucker = tucker_decompose_opt_layer(layer, inps, args, num_heads, i)
                     
                     tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i)
-                    return tensor_train
+                    tt_error = check_error_tensor_train_opt(layer, inps, args, num_heads, i)
+                    return tt_error
 
                     rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
                     rank_v = num_heads * torch.amax((torch.cumsum(eval_v, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
