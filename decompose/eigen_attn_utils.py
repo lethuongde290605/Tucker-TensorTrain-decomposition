@@ -702,7 +702,14 @@ def check_error_tensor_train_opt(layer, fp_inps, args, num_heads, layer_id, rank
     error_q = torch.norm(w_q.float() - w_q_reconstructed) / torch.norm(w_q.float())
     error_k = torch.norm(w_k.float() - w_k_reconstructed) / torch.norm(w_k.float())
     error_v = torch.norm(w_v.float() - w_v_reconstructed) / torch.norm(w_v.float())
-
+    print(f"Original Shape: {w_q.shape}")
+    for i in range(len(tt_results["Q"]["factors"])):  
+        print(f"Compression Shape: {tt_results['Q']['factors'][i].shape}")
+    # Compression Ratio = (Original Size - Compressed Size) / Original Size
+    original_size = w_q.numel()
+    compressed_size = sum([f.numel() for f in tt_results["Q"]["factors"]])
+    compression_ratio = (original_size - compressed_size) / original_size
+    print(f"Compression Ratio: {compression_ratio}")
     print(f"Relative Error - Q: {error_q.item():.6f}, K: {error_k.item():.6f}, V: {error_v.item():.6f}")
 
     return {
