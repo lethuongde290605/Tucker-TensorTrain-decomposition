@@ -489,7 +489,7 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=
     def prepare_tensor(t):
         # [32, 2048, 768] -> [32, 2048, 12, 64]
         t = t.view(t.shape[0], t.shape[1], num_heads, head_dim)
-        # keep batch_size and seq_len: [65536, 12, 64]
+        # keep batch_size and seq_len: [65536, 12, 64] => [65536, 4, 4, 4, 4, 3]
         t = t.view(-1, num_heads, head_dim)
         # reshape tensor for Tucker: [65536, 3, 4, 4, 4, 4]
         t = t.view(-1, 3, 4, 4, 4, 4)
