@@ -566,37 +566,41 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     w_k = prepare_tensor(w_k)
     w_v = prepare_tensor(w_v)
     print(f"Reshaped for TensorTrain - Q: {w_q.shape}")  # Expected: (16, 16, 16, 16, 9)
+    # Tính TT-rank tối đa: r_i = min(∏ dims[:i+1], ∏ dims[i+1:])
+    dims = list(w_q.shape)  # [16, 16, 16, 16, 9]
+    n = len(dims)
+    max_ranks = [1]
+    for i in range(1, n):
+        left = 1
+        for d in dims[:i]:
+            left *= d
+        right = 1
+        for d in dims[i:]:
+            right *= d
+        max_ranks.append(min(left, right))
+    max_ranks.append(1)
+    # max_ranks = [1, 16, 256, 144, 9, 1]
+
     # Tensor 5 chiều => List rank cần 6 phần tử: [1, r1, r2, r3, r4, 1]
     if ranks is None:
-        # Tính TT-rank tối đa (exact decomposition): r_i = min(∏ dims[:i+1], ∏ dims[i+1:])
-        dims = list(w_q.shape)  # [16, 16, 16, 16, 9]
-        n = len(dims)
-        tt_ranks = [1]
-        for i in range(1, n):
-            left = 1
-            for d in dims[:i]:
-                left *= d
-            right = 1
-            for d in dims[i:]:
-                right *= d
-            tt_ranks.append(min(left, right))
-        tt_ranks.append(1)
-        # Kết quả: [1, 16, 256, 144, 9, 1]
-        target_ranks = tt_ranks
+        # Exact decomposition: dùng max ranks
+        target_ranks = max_ranks
         
-    elif isinstance(ranks, int):
-        # Nếu truyền 1 số nguyên => dùng chung cho các rank ở giữa
-        target_ranks = [1, ranks, ranks, ranks, ranks, 1]
+    elif isinstance(ranks, list) and len(ranks) == 6:
+        # Validate: mỗi rank không được vượt quá max rank tương ứng
+        for i, (r, m) in enumerate(zip(ranks, max_ranks)):
+            if r > m:
+                raise ValueError(
+                    f"ranks[{i}]={r} vượt quá max rank={m}. "
+                    f"Max ranks cho tensor {dims}: {max_ranks}"
+                )
+        target_ranks = ranks
         
-    elif isinstance(ranks, list):
-        if len(ranks) == 4:
-            # Nếu truyền list [r1, r2, r3, r4] => thêm 1 vào đầu và cuối
-            target_ranks = [1] + ranks + [1]
-        elif len(ranks) == 6:
-            # Nếu đã truyền đủ
-            target_ranks = ranks
-        else:
-            raise ValueError("Với Tensor 5 chiều, ranks phải là list 4 hoặc 6 phần tử.")
+    else:
+        raise ValueError(
+            f"ranks phải là None (exact) hoặc list 6 phần tử [1, r1, r2, r3, r4, 1]. "
+            f"Max ranks: {max_ranks}"
+        )
 
     print(f"Target Ranks (TT-Ranks): {target_ranks}")
 
@@ -649,72 +653,3 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     }
     
     return results
-
-def check_error_tensor_train_opt(layer, fp_inps, args, num_heads, layer_id, ranks=None):
-    
-    # Original weights
-    w_q = layer.self_attn.q_proj.weight.data 
-    w_k = layer.self_attn.k_proj.weight.data 
-    w_v = layer.self_attn.v_proj.weight.data
-
-    # TensorTrain decomposition
-    tt_results = tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks)
-
-    dim_factors = [(4, 4), (4, 4), (4, 4), (4, 4), (3, 3)]
-
-    # Đảo ngược reshape_factors về lại (r1, m*n, r2)
-    def reverse_reshape_factors(factors):
-        reversed_factors = []
-        for i, f in enumerate(factors):
-            # f hiện có shape (m, r1, n, r2)
-            m, r1, n, r2 = f.shape
-            # Đảo ngược permute: (m, r1, n, r2) → (r1, m, n, r2)
-            f = f.permute(1, 0, 2, 3)
-            # Đảo ngược view: (r1, m, n, r2) → (r1, m*n, r2)
-            f = f.reshape(r1, m * n, r2)
-            reversed_factors.append(f)
-        return reversed_factors
-
-    # Đảo ngược prepare_tensor từ (16,16,16,16,9) về (768, 768)
-    def reverse_prepare_tensor(t):
-        # (16,16,16,16,9) → (4,4, 4,4, 4,4, 4,4, 3,3)
-        t = t.view(4, 4, 4, 4, 4, 4, 4, 4, 3, 3)
-        # Đảo ngược permute(0,5,1,6,2,7,3,8,4,9)
-        # Inverse permutation: (0,2,4,6,8, 1,3,5,7,9)
-        t = t.permute(0, 2, 4, 6, 8, 1, 3, 5, 7, 9)
-        # (4,4,4,4,3, 4,4,4,4,3) → (768, 768)
-        t = t.reshape(768, 768)
-        return t
-
-    # Reconstruct Q
-    factors_q_tt = reverse_reshape_factors(tt_results["Q"]["factors"])
-    w_q_reconstructed = reverse_prepare_tensor(tt_to_tensor(factors_q_tt))
-
-    # Reconstruct K
-    factors_k_tt = reverse_reshape_factors(tt_results["K"]["factors"])
-    w_k_reconstructed = reverse_prepare_tensor(tt_to_tensor(factors_k_tt))
-
-    # Reconstruct V
-    factors_v_tt = reverse_reshape_factors(tt_results["V"]["factors"])
-    w_v_reconstructed = reverse_prepare_tensor(tt_to_tensor(factors_v_tt))
-
-    # Tính relative error
-    error_q = torch.norm(w_q.float() - w_q_reconstructed) / torch.norm(w_q.float())
-    error_k = torch.norm(w_k.float() - w_k_reconstructed) / torch.norm(w_k.float())
-    error_v = torch.norm(w_v.float() - w_v_reconstructed) / torch.norm(w_v.float())
-    print(f"Original Shape: {w_q.shape}")
-    for i in range(len(tt_results["Q"]["factors"])):  
-        print(f"Compression Shape: {tt_results['Q']['factors'][i].shape}")
-    # Compression Ratio = (Original Size - Compressed Size) / Original Size
-    original_size = w_q.numel()
-    compressed_size = sum([f.numel() for f in tt_results["Q"]["factors"]])
-    compression_ratio = (original_size - compressed_size) / original_size
-    print(f"Compression Ratio: {compression_ratio}")
-    print(f"Relative Error - Q: {error_q.item():.6f}, K: {error_k.item():.6f}, V: {error_v.item():.6f}")
-
-    return {
-        "error_q": error_q.item(),
-        "error_k": error_k.item(),
-        "error_v": error_v.item(),
-    }
-
