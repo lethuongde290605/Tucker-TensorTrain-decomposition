@@ -5,6 +5,7 @@ import os
 import scipy
 import tensorly
 from tensorly.decomposition import tensor_train
+from tensorly.tt_tensor import tt_to_tensor
 tensorly.set_backend('pytorch')
 
 
@@ -547,7 +548,6 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     w_k = layer.self_attn.k_proj.weight.data 
     w_v = layer.self_attn.v_proj.weight.data
     print(f"Original Shape - Q: {w_q.shape}, K: {w_k.shape}, V: {w_v.shape}") 
-    print(f"Q: {w_q}")
     
     # Ta tách hidden_dim 768 = 4x4x4x4x3
     # Reshape (768, 768) -> (16, 16, 16, 16, 9) theo TT-matrix format
@@ -564,29 +564,41 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     w_k = prepare_tensor(w_k)
     w_v = prepare_tensor(w_v)
     print(f"Reshaped for TensorTrain - Q: {w_q.shape}")  # Expected: (16, 16, 16, 16, 9)
-    print(f"Q after reshape: {w_q}")
+    # Tính TT-rank tối đa: r_i = min(∏ dims[:i+1], ∏ dims[i+1:])
+    dims = list(w_q.shape)  # [16, 16, 16, 16, 9]
+    n = len(dims)
+    max_ranks = [1]
+    for i in range(1, n):
+        left = 1
+        for d in dims[:i]:
+            left *= d
+        right = 1
+        for d in dims[i:]:
+            right *= d
+        max_ranks.append(min(left, right))
+    max_ranks.append(1)
+    # max_ranks = [1, 16, 256, 144, 9, 1]
+
     # Tensor 5 chiều => List rank cần 6 phần tử: [1, r1, r2, r3, r4, 1]
     if ranks is None:
-        # Đặt rank mặc định dựa trên kích thước dimensions
-        r1 = min(w_q.shape[0], w_q.shape[1])  # min(16, 16) = 16
-        r2 = min(w_q.shape[1], w_q.shape[2])  # min(16, 16) = 16
-        r3 = min(w_q.shape[2], w_q.shape[3])  # min(16, 16) = 16
-        r4 = min(w_q.shape[3], w_q.shape[4])  # min(16, 9) = 9
-        target_ranks = [1, r1, r2, r3, r4, 1]
+        # Exact decomposition: dùng max ranks
+        target_ranks = max_ranks
         
-    elif isinstance(ranks, int):
-        # Nếu truyền 1 số nguyên => dùng chung cho các rank ở giữa
-        target_ranks = [1, ranks, ranks, ranks, ranks, 1]
+    elif isinstance(ranks, list) and len(ranks) == 6:
+        # Validate: mỗi rank không được vượt quá max rank tương ứng
+        for i, (r, m) in enumerate(zip(ranks, max_ranks)):
+            if r > m:
+                raise ValueError(
+                    f"ranks[{i}]={r} vượt quá max rank={m}. "
+                    f"Max ranks cho tensor {dims}: {max_ranks}"
+                )
+        target_ranks = ranks
         
-    elif isinstance(ranks, list):
-        if len(ranks) == 4:
-            # Nếu truyền list [r1, r2, r3, r4] => thêm 1 vào đầu và cuối
-            target_ranks = [1] + ranks + [1]
-        elif len(ranks) == 6:
-            # Nếu đã truyền đủ
-            target_ranks = ranks
-        else:
-            raise ValueError("Với Tensor 5 chiều, ranks phải là list 4 hoặc 6 phần tử.")
+    else:
+        raise ValueError(
+            f"ranks phải là None (exact) hoặc list 6 phần tử [1, r1, r2, r3, r4, 1]. "
+            f"Max ranks: {max_ranks}"
+        )
 
     print(f"Target Ranks (TT-Ranks): {target_ranks}")
 
@@ -597,12 +609,7 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
         
         with torch.cuda.amp.autocast(enabled=False):
             tt_tensor = tensor_train(tensor, rank=target_ranks, verbose=False)
-        
-        # Lấy danh sách các factors
-        # Factors sẽ gồm 3 tensor con:
-        # F1: (1, rows, r1)
-        # F2: (r1, heads, r2)
-        # F3: (r2, dim, 1)
+    
         factors = tt_tensor.factors 
         
         return factors
