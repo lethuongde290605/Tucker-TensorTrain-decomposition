@@ -249,9 +249,12 @@ def decompose(tensor, rank, modes):
         core:    The Tucker core tensor.
         factors: List of factor matrices.
     """
-    (core, factors), rec_errors = partial_tucker(
-        tensor, rank=rank, modes=modes, n_iter_max=200, verbose=True
-    )
+
+    tensor = tensor.to(torch.float32)
+    with torch.cuda.amp.autocast(enabled=False):
+        (core, factors), rec_errors = partial_tucker(
+            tensor, rank=rank, modes=modes, n_iter_max=200, verbose=True
+        )
 
     print("core shape: ", core.shape)
     print("factor shapes:")
