@@ -263,7 +263,7 @@ def decompose(tensor, rank, modes):
 
     # Compression stats
     original_size = math.prod(tensor.shape)
-    compressed_size = sum(f.size for f in factors) + core.size
+    compressed_size = sum(f.numel() for f in factors) + core.numel()
     compression_ratio = compressed_size / original_size
 
     print()
