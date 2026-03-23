@@ -350,8 +350,8 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compre
     print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}")
 
     # Factorize the feature dimension (dim=768) into 5 sub-dimensions
-    dim1_factors = factorize_dim(tensor_q.shape[1], count=5)
-    print(f"Dim-1 factors ({tensor_q.shape[1]} -> {dim1_factors})")
+    dim1_factors = factorize_dim(tensor_q.shape[2], count=5)
+    print(f"Dim-1 factors ({tensor_q.shape[2]} -> {dim1_factors})")
 
     tensor_q = prepare_tensor(tensor_q, dim1_factors)
     tensor_k = prepare_tensor(tensor_k, dim1_factors)
