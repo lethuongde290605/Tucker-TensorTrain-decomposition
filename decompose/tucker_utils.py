@@ -83,8 +83,7 @@ def prepare_tensor(tensor, dim1_factors: list[int]):
     Returns:
         Reshaped tensor of shape (N, *dim1_factors).
     """
-    N = tensor.shape[0]
-    result = tensor.reshape(N, *dim1_factors)
+    result = tensor.reshape(tensor.shape[0] * tensor.shape[1], *dim1_factors)
     return result
 
 
