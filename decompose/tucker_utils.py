@@ -291,8 +291,8 @@ def reconstruct(tensor, core, factors, modes):
     """
     reconstructed_tensor = multi_mode_dot(core, factors, modes=modes)
 
-    tensor_t = torch.from_numpy(tensor)
-    reconstructed_t = torch.from_numpy(reconstructed_tensor)
+    tensor_t = tensor
+    reconstructed_t = reconstructed_tensor
     diff = tensor_t - reconstructed_t
 
     frob_error = torch.norm(diff).item()
