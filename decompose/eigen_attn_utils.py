@@ -478,176 +478,120 @@ def decompose_llama_layer(layer, fp_inps, args, num_heads, layer_id, attention_m
     return basis_kq, eval_kq, basis_v, eval_v
 
 
-def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=None):
-    
-    # shape = (nsamples / avg_dim, sq_len = 2048, dim = 768)
+def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compression_ratio=0.7):
+    """
+    Decompose the Q, K, V activation tensors of an OPT attention layer
+    using Partial Tucker decomposition (via tucker_utils helpers).
+
+    Args:
+        layer:             Transformer layer whose Q/K/V projections are hooked.
+        fp_inps:           Full-precision calibration inputs.
+        args:              Argument namespace (must contain eigen_attn_params).
+        num_heads:         Number of attention heads (unused, kept for API consistency).
+        layer_id:          Layer index (unused, kept for API consistency).
+        compression_ratio: Target Tucker compression rate in (0, 1].
+
+    Returns:
+        Dict with keys "Q", "K", "V", each mapping to a sub-dict containing
+        "core", "factors", "compression_ratio", and "relative_error".
+    """
+    from decompose.tucker_utils import (
+        factorize_dim,
+        prepare_tensor,
+        calculate_rank,
+        _decompose_one,
+    )
+
+    # shape returned by get_kqv_opt: (nsamples / avg_dim, seq_len, dim)
     tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
-    print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}") 
+    print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}")
 
-    head_dim = tensor_q.shape[-1] // num_heads # 768 / 12 = 64
-    
-    
-    def prepare_tensor(t):
-        # keep batch_size and seq_len: [65536, 12, 64] => [65536, 4, 4, 4, 4, 3]
-        t = t.view(-1, t.shape[2])
-        # reshape tensor for Tucker: [65536, 3, 4, 4, 4, 4]
-        t = t.view(-1, 4, 4, 4, 4, 3)
-        return t
+    # Factorize the feature dimension into 5 sub-dimensions
+    dim1_factors = factorize_dim(tensor_q.shape[2], count=5)
+    print(f"Dim-1 factors ({tensor_q.shape[2]} -> {dim1_factors})")
 
-    tensor_q = prepare_tensor(tensor_q)
-    tensor_k = prepare_tensor(tensor_k)
-    tensor_v = prepare_tensor(tensor_v)
-    
-    print(f"Reshaped for Tucker - Q: {tensor_q.shape}") 
+    tensor_q = prepare_tensor(tensor_q, dim1_factors)
+    tensor_k = prepare_tensor(tensor_k, dim1_factors)
+    tensor_v = prepare_tensor(tensor_v, dim1_factors)
+    print(f"Tensor shape after prepare_tensor: {tensor_q.shape}")
 
-    if ranks is None:
-        target_ranks = [tensor_q.shape[0], 2, 2, 2, 2, 2]
-    else:
-        target_ranks = ranks
+    # Calculate Tucker ranks for all modes except the batch dimension (mode 0)
+    modes = list(range(1, tensor_q.ndim))
+    rank = calculate_rank(tensor_q.shape, modes, compression_ratio)
+    print(f"Target Ranks: {rank}")
 
-    print(f"Target Ranks: {target_ranks}")
-
-    results = {}
-    
-    def run_tucker(tensor, name, target_ranks):
-        print(f"Decomposing {name}...")
-        
-        # tensorly only support for float32
-        tensor = tensor.to(torch.float32)
-        
-        with torch.cuda.amp.autocast(enabled=False):
-            core, factors = tensorly.decomposition.tucker(tensor, rank=target_ranks, init='svd')
-            # core, factors = tensorly.decomposition.tucker(
-            #     tensor,
-            #     rank=target_ranks,
-            #     init=(core0, factors0),   
-            #     fixed_factors=[0], 
-            # )
-
-        
-        return core, factors
-
-    core_q, factors_q = run_tucker(tensor_q, "Query", target_ranks)
-    core_k, factors_k = run_tucker(tensor_k, "Key", target_ranks)
-    core_v, factors_v = run_tucker(tensor_v, "Value", target_ranks)
-
-    print(f"Factors Q shapes: {[f.shape for f in factors_q]}")
-
+    # Decompose each tensor (partial Tucker + reconstruction error)
+    named_tensors = {"Q": tensor_q, "K": tensor_k, "V": tensor_v}
     results = {
-        "Q": {"core": core_q, "factors": factors_q},
-        "K": {"core": core_k, "factors": factors_k},
-        "V": {"core": core_v, "factors": factors_v}
+        name: _decompose_one(name, tensor, rank, modes)
+        for name, tensor in named_tensors.items()
     }
-    
+
+    # Summary
+    print("\n--- Summary ---")
+    print(f"  Core Q shape    : {results['Q']['core'].shape}")
+    print(f"  Factors Q shapes: {[f.shape for f in results['Q']['factors']]}")
+    for name in ("Q", "K", "V"):
+        print(
+            f"  {name} | rel_err={results[name]['relative_error']:.6f}"
+            f"  comp_ratio={results[name]['compression_ratio']:.4f}"
+        )
+
     return results
 
 
-def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=None):
-    # Input: W_q, W_k, W_v 
-    w_q = layer.self_attn.q_proj.weight.data  # shape: (hidden_dim, hidden_dim) = (768, 768)
-    w_k = layer.self_attn.k_proj.weight.data 
+def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, ranks=None, num_factors=5):
+    """
+    Decompose the Q, K, V weight matrices of an OPT attention layer
+    using Tensor-Train decomposition (via tensor_train_utils helpers).
+
+    Args:
+        layer:       Transformer layer containing self_attn.{q,k,v}_proj.weight.
+        fp_inps:     Full-precision calibration inputs (unused, kept for API consistency).
+        args:        Argument namespace (unused, kept for API consistency).
+        num_heads:   Number of attention heads (unused, kept for API consistency).
+        layer_id:    Layer index (unused, kept for API consistency).
+        ranks:       TT-ranks.  None -> exact decomposition (uses max ranks).
+                     Must be a list of length (num_factors + 1) with first/last == 1.
+        num_factors: Number of TT-modes to split each weight dimension into.
+
+    Returns:
+        Dict with keys "Q", "K", "V", each mapping to a sub-dict containing
+        "factors", "metadata", and "compression_ratio".
+    """
+    from decompose.tensor_train_utils import tensor_train_decompose
+
+    w_q = layer.self_attn.q_proj.weight.data
+    w_k = layer.self_attn.k_proj.weight.data
     w_v = layer.self_attn.v_proj.weight.data
-    print(f"Original Shape - Q: {w_q.shape}, K: {w_k.shape}, V: {w_v.shape}") 
-    
-    # Ta tách hidden_dim 768 = 4x4x4x4x3
-    # Reshape (768, 768) -> (16, 16, 16, 16, 9) theo TT-matrix format
-    def prepare_tensor(t):
-        # (768, 768) -> (4, 4, 4, 4, 3, 4, 4, 4, 4, 3)
-        t = t.view(4, 4, 4, 4, 3, 4, 4, 4, 4, 3)
-        # Interleave row/col factors: (0,5), (1,6), (2,7), (3,8), (4,9)
-        t = t.permute(0, 5, 1, 6, 2, 7, 3, 8, 4, 9)
-        # Reshape to combine pairs: (4*4, 4*4, 4*4, 4*4, 3*3) = (16, 16, 16, 16, 9)
-        t = t.reshape(16, 16, 16, 16, 9)
-        return t
+    print(f"Original Shape - Q: {w_q.shape}, K: {w_k.shape}, V: {w_v.shape}")
 
-    w_q = prepare_tensor(w_q)
-    w_k = prepare_tensor(w_k)
-    w_v = prepare_tensor(w_v)
-    print(f"Reshaped for TensorTrain - Q: {w_q.shape}")  # Expected: (16, 16, 16, 16, 9)
-    # Tính TT-rank tối đa: r_i = min(∏ dims[:i+1], ∏ dims[i+1:])
-    dims = list(w_q.shape)  # [16, 16, 16, 16, 9]
-    n = len(dims)
-    max_ranks = [1]
-    for i in range(1, n):
-        left = 1
-        for d in dims[:i]:
-            left *= d
-        right = 1
-        for d in dims[i:]:
-            right *= d
-        max_ranks.append(min(left, right))
-    max_ranks.append(1)
-    # max_ranks = [1, 16, 256, 144, 9, 1]
-
-    # Tensor 5 chiều => List rank cần 6 phần tử: [1, r1, r2, r3, r4, 1]
-    if ranks is None:
-        # Exact decomposition: dùng max ranks
-        target_ranks = max_ranks
-        
-    elif isinstance(ranks, list) and len(ranks) == 6:
-        # Validate: mỗi rank không được vượt quá max rank tương ứng
-        for i, (r, m) in enumerate(zip(ranks, max_ranks)):
-            if r > m:
-                raise ValueError(
-                    f"ranks[{i}]={r} vượt quá max rank={m}. "
-                    f"Max ranks cho tensor {dims}: {max_ranks}"
-                )
-        target_ranks = ranks
-        
-    else:
-        raise ValueError(
-            f"ranks phải là None (exact) hoặc list 6 phần tử [1, r1, r2, r3, r4, 1]. "
-            f"Max ranks: {max_ranks}"
+    results = {}
+    for name, weight in (("Q", w_q), ("K", w_k), ("V", w_v)):
+        print(f"\n--- {name} ---")
+        reshaped_factors, raw_factors, metadata = tensor_train_decompose(
+            weight, num_factors=num_factors, ranks=ranks
         )
 
-    print(f"Target Ranks (TT-Ranks): {target_ranks}")
+        # Compression stats
+        original_size = weight.numel()
+        compressed_size = sum(f.numel() for f in reshaped_factors)
+        compression_ratio = compressed_size / original_size
+        print(f"  Compression ratio: {compression_ratio:.4f}  ({compression_ratio * 100:.2f} %)")
 
-    def run_tensor_train(tensor, name, target_ranks):
-        print(f"Decomposing {name} with shape {tensor.shape}...")
-        
-        tensor = tensor.to(torch.float32)
-        
-        with torch.cuda.amp.autocast(enabled=False):
-            tt_tensor = tensor_train(tensor, rank=target_ranks, verbose=False)
-    
-        factors = tt_tensor.factors 
-        
-        return factors
+        results[name] = {
+            "factors": reshaped_factors,
+            "metadata": metadata,
+            "compression_ratio": compression_ratio,
+        }
 
-    # Thực hiện phân rã
-    factors_q = run_tensor_train(w_q, "Query", target_ranks)
-    factors_k = run_tensor_train(w_k, "Key", target_ranks)
-    factors_v = run_tensor_train(w_v, "Value", target_ranks)
+    # Summary
+    print("\n--- Summary ---")
+    for name in ("Q", "K", "V"):
+        r = results[name]
+        print(
+            f"  {name} | factors={[list(f.shape) for f in r['factors']]}"
+            f"  comp_ratio={r['compression_ratio']:.4f}"
+        )
 
-    print(f"Factors Q shapes (before reshape): {[f.shape for f in factors_q]}")
-
-    # Reshape factors từ (r1, m*n, r2) -> (m, r1, n, r2)
-    # Với tensor 5D (16, 16, 16, 16, 9), mỗi chiều = m*n trong đó m=n=4 hoặc m=n=3
-    # Các chiều: 16=4*4, 16=4*4, 16=4*4, 16=4*4, 9=3*3
-    dim_factors = [(4, 4), (4, 4), (4, 4), (4, 4), (3, 3)]  # (m, n) cho mỗi chiều
-    
-    def reshape_factors(factors):
-        reshaped = []
-        for i, f in enumerate(factors):
-            # f có shape (r1, m*n, r2)
-            r1, mn, r2 = f.shape
-            m, n = dim_factors[i]
-            # Reshape (r1, m*n, r2) -> (r1, m, n, r2) -> (m, r1, n, r2)
-            f = f.view(r1, m, n, r2)
-            f = f.permute(1, 0, 2, 3)  # (m, r1, n, r2)
-            reshaped.append(f)
-        return reshaped
-    
-    factors_q = reshape_factors(factors_q)
-    factors_k = reshape_factors(factors_k)
-    factors_v = reshape_factors(factors_v)
-
-    print(f"Factors Q shapes (after reshape): {[f.shape for f in factors_q]}")
-
-    results = {
-        "Q": {"factors": factors_q},
-        "K": {"factors": factors_k},
-        "V": {"factors": factors_v}
-    }
-    
     return results

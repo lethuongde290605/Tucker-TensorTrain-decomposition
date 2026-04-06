@@ -313,7 +313,7 @@ def reconstruct(tensor, core, factors, modes):
 if __name__ == "__main__":
 
     rng = tl.check_random_state(1234)
-    rand_tensor = tl.tensor(rng.random_sample((1024, 768)))
+    rand_tensor = tl.tensor(rng.standard_normal((1024, 768)))
 
     # Factorize the second dimension (768) into 5 sub-dims
     dim1_factors = factorize_dim(rand_tensor.shape[1], count=5)

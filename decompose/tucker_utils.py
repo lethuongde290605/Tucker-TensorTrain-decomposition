@@ -1,9 +1,9 @@
-from decompose.eigen_attn_utils import get_kqv_opt
-import pytest
 import math
 import numpy as np
 import tensorly as tl
 import torch
+
+tl.set_backend('pytorch')  # TensorLy must use the PyTorch backend since all tensors are torch.Tensor
 
 from tensorly.decomposition import (
     tucker,
@@ -349,6 +349,7 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compre
         "core", "factors", "compression_ratio", and "relative_error".
     """
     # shape returned by get_kqv_opt: (nsamples / avg_dim, seq_len, dim)
+    from decompose.eigen_attn_utils import get_kqv_opt  # lazy import: only needed in real runs
     tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
     print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}")
 
@@ -382,3 +383,91 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compre
         )
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Standalone test (no real model needed)
+# ---------------------------------------------------------------------------
+
+def test_tucker_pipeline(
+    nsamples: int = 8,
+    seq_len: int = 32,
+    hidden_dim: int = 768,
+    num_factors: int = 5,
+    compression_ratio: float = 0.7,
+    seed: int = 42,
+):
+    """
+    Test the full Tucker decomposition pipeline with random Q/K/V tensors,
+    mirroring the steps inside tucker_decompose_opt_layer.
+
+    Args:
+        nsamples:          Number of samples (first dimension of each tensor).
+        seq_len:           Sequence length (second dimension).
+        hidden_dim:        Feature dimension to be factorized (e.g. 768).
+        num_factors:       Number of sub-dimensions to split hidden_dim into.
+        compression_ratio: Target Tucker compression rate in (0, 1].
+        seed:              Random seed for reproducibility.
+
+    Returns:
+        Same results dict as tucker_decompose_opt_layer:
+        {"Q": {...}, "K": {...}, "V": {...}}
+    """
+    torch.manual_seed(seed)
+    print("=" * 60)
+    print("  Tucker Pipeline Test  (random tensors)")
+    print("=" * 60)
+
+    # Simulate activation tensors: (nsamples, seq_len, hidden_dim)
+    # Using torch.rand (uniform [0,1]) to mimic real activations which have
+    # non-zero means and concentrated energy in leading singular values.
+    # (torch.randn gives zero-mean Gaussian with no low-rank structure, yielding
+    #  artificially high reconstruction error on any compression.)
+    tensor_q = torch.rand(nsamples, seq_len, hidden_dim)
+    tensor_k = torch.rand(nsamples, seq_len, hidden_dim)
+    tensor_v = torch.rand(nsamples, seq_len, hidden_dim)
+    print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}")
+
+    # Step 1: factorize the feature dimension
+    dim1_factors = factorize_dim(hidden_dim, count=num_factors)
+    print(f"Dim-1 factors ({hidden_dim} -> {dim1_factors})")
+
+    # Step 2: reshape tensors
+    tensor_q = prepare_tensor(tensor_q, dim1_factors)
+    tensor_k = prepare_tensor(tensor_k, dim1_factors)
+    tensor_v = prepare_tensor(tensor_v, dim1_factors)
+    print(f"Tensor shape after prepare_tensor: {tensor_q.shape}")
+
+    # Step 3: calculate Tucker ranks for the target compression ratio
+    modes = list(range(1, tensor_q.ndim))
+    rank = calculate_rank(tensor_q.shape, modes, compression_ratio)
+    print(f"Target Ranks: {rank}")
+
+    # Step 4: decompose + reconstruct each tensor
+    named_tensors = {"Q": tensor_q, "K": tensor_k, "V": tensor_v}
+    results = {
+        name: _decompose_one(name, tensor, rank, modes)
+        for name, tensor in named_tensors.items()
+    }
+
+    # Summary
+    print("\n--- Summary ---")
+    print(f"  Core Q shape    : {results['Q']['core'].shape}")
+    print(f"  Factors Q shapes: {[f.shape for f in results['Q']['factors']]}")
+    for name in ("Q", "K", "V"):
+        print(
+            f"  {name} | rel_err={results[name]['relative_error']:.6f}"
+            f"  comp_ratio={results[name]['compression_ratio']:.4f}"
+        )
+
+    return results
+
+
+if __name__ == "__main__":
+    test_tucker_pipeline(
+        nsamples=8,
+        seq_len=32,
+        hidden_dim=768,
+        num_factors=5,
+        compression_ratio=0.7,
+    )
