@@ -3,9 +3,12 @@ import torch.nn as nn
 import copy
 import gc
 
-from decompose.eigen_attn_utils import decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer, tucker_decompose_opt_layer, tensor_train_decompose_opt_layer
+from decompose.eigen_attn_utils import (decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer,
+                                         tucker_decompose_opt_layer, tensor_train_decompose_opt_layer,
+                                         apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores)
 from decompose.tucker_utils import tucker_decompose_opt_layer
-from models.decompose_modules import OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer
+from models.decompose_modules import (OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer,
+                                      OPTTuckerTTDecoderLayer)
 
 
 def eigenattn(
@@ -141,9 +144,33 @@ def eigenattn(
                     error = 0.0
                     num_heads = lm.model.config.num_attention_heads
                     # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
-                    tucker = tucker_decompose_opt_layer(layer, inps, args, num_heads, i)
-                    
+                    tucker       = tucker_decompose_opt_layer(layer, inps, args, num_heads, i)
                     tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i)
+
+                    # ---- build compressed Q / K / V weight matrices --------
+                    # tucker["Q/K/V"]["factors"]       : list of k Tucker factor matrices (n_i, q_i)
+                    # tensor_train["Q/K/V"]["factors"] : list of k TT-matrix cores (r_i, m_i, n_i, r_{i+1})
+                    new_weights = {}
+                    for proj in ("Q", "K", "V"):
+                        tucker_factors = tucker[proj]["factors"]
+                        tt_cores       = tensor_train[proj]["factors"]
+
+                        # mode-multiply Tucker factors into TT cores
+                        # new core shape: (r_i, m_i, q_i, r_{i+1})
+                        combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores)
+
+                        # reconstruct compressed 2-D weight: (M, Q)
+                        # M = prod(m_i) = embed_dim,  Q = prod(q_i) < embed_dim
+                        new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
+
+                    qlayer = OPTTuckerTTDecoderLayer(
+                        ori_layer = layer,
+                        config    = lm.model.config,
+                        w_q       = new_weights["Q"],
+                        w_k       = new_weights["K"],
+                        w_v       = new_weights["V"],
+                    ).to(dev)
+                    '''
                     return tensor_train
 
                     rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
@@ -171,6 +198,7 @@ def eigenattn(
                     # del output_hr, output_lr, basis_kq, basis_v
                     del basis_kq, basis_v
                     torch.cuda.empty_cache()
+                    '''
 
                     # obtain output of model for propagation to next layer
                     with torch.no_grad():
