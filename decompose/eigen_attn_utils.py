@@ -569,18 +569,18 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     results = {}
     for name, weight in (("Q", w_q), ("K", w_k), ("V", w_v)):
         print(f"\n--- {name} ---")
-        reshaped_factors, raw_factors, metadata = tensor_train_decompose(
+        factors, metadata = tensor_train_decompose(
             weight, num_factors=num_factors, ranks=ranks
         )
 
         # Compression stats
         original_size = weight.numel()
-        compressed_size = sum(f.numel() for f in reshaped_factors)
+        compressed_size = sum(f.numel() for f in factors)
         compression_ratio = compressed_size / original_size
         print(f"  Compression ratio: {compression_ratio:.4f}  ({compression_ratio * 100:.2f} %)")
 
         results[name] = {
-            "factors": reshaped_factors,
+            "factors": factors,
             "metadata": metadata,
             "compression_ratio": compression_ratio,
         }
@@ -595,3 +595,98 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
         )
 
     return results
+
+
+def apply_tucker_factors_to_tt_cores(
+    tucker_factors: list,
+    tt_cores: list,
+) -> list:
+    """
+    Contract Tucker factors into TT-matrix cores via mode multiplication.
+
+    For each mode i:
+        tucker_factors[i] has shape  (n_i, q_i)
+        tt_cores[i]       has shape  (r_i, m_i, n_i, r_{i+1})
+
+    The n_i axis is shared and is contracted out:
+        new_core[r, m, q, R] = sum_n  core[r, m, n, R] * factor[n, q]
+
+    This is a mode-2 product of the TT-matrix core with the Tucker factor matrix,
+    equivalent to:
+        new_core_i = einsum('rmnR, nq -> rmqR', core_i, factor_i)
+
+    Result shape per core: (r_i, m_i, q_i, r_{i+1})
+
+    Args:
+        tucker_factors: List of k factor matrices, each of shape (n_i, q_i).
+        tt_cores:       List of k TT-matrix cores, each of shape (r_i, m_i, n_i, r_{i+1}).
+
+    Returns:
+        List of k new TT-matrix cores, each of shape (r_i, m_i, q_i, r_{i+1}).
+    """
+    assert len(tucker_factors) == len(tt_cores), (
+        f"Number of Tucker factors ({len(tucker_factors)}) must match "
+        f"number of TT cores ({len(tt_cores)})"
+    )
+
+    new_cores = []
+    for i, (factor, core) in enumerate(zip(tucker_factors, tt_cores)):
+        # factor: (n_i, q_i)
+        # core:   (r_i, m_i, n_i, r_{i+1})
+        assert factor.shape[0] == core.shape[2], (
+            f"Mode {i}: factor.shape[0]={factor.shape[0]} must equal "
+            f"core.shape[2]={core.shape[2]} (the shared n_i dimension)"
+        )
+        # Contract n_i: (r, m, n, R) x (n, q) -> (r, m, q, R)
+        new_core = torch.einsum('rmnR, nq -> rmqR', core, factor)
+        new_cores.append(new_core)
+
+    return new_cores
+
+
+def reconstruct_combined_tt_cores(new_cores: list) -> torch.Tensor:
+    """
+    Reconstruct a 2-D weight matrix from TT-matrix cores that have already been
+    contracted with Tucker factors (output of apply_tucker_factors_to_tt_cores).
+
+    Each core has shape (r_i, m_i, q_i, r_{i+1}).
+
+    Steps:
+      1. tt_matrix_to_tensor(new_cores)
+             → interleaved tensor of shape (m1, q1, m2, q2, ..., mk, qk)
+      2. Permute to separate row and col groups:
+             → (m1, m2, ..., mk, q1, q2, ..., qk)
+      3. Reshape to 2-D weight matrix:
+             → (m1 * m2 * ... * mk,  q1 * q2 * ... * qk)
+
+    Args:
+        new_cores: List of k TT-matrix cores, each of shape (r_i, m_i, q_i, r_{i+1}).
+
+    Returns:
+        2-D tensor of shape (M, Q) where M = prod(m_i) and Q = prod(q_i).
+    """
+    from tensorly.tt_matrix import tt_matrix_to_tensor
+    import math
+
+    k = len(new_cores)
+
+    # Collect m and q dims from the cores
+    m_dims = [core.shape[1] for core in new_cores]   # row sub-dims
+    q_dims = [core.shape[2] for core in new_cores]   # col sub-dims (Tucker-compressed)
+
+    # Step 1: reconstruct — output shape is interleaved (m1, q1, m2, q2, ..., mk, qk)
+    reconstructed = tt_matrix_to_tensor(new_cores)   # shape: (m1, q1, ..., mk, qk)
+
+    # Step 2: permute to (m1, m2, ..., mk, q1, q2, ..., qk)
+    # Interleaved indices:  m at 0, 2, 4, ...   q at 1, 3, 5, ...
+    m_axes = list(range(0, 2 * k, 2))   # [0, 2, 4, ..., 2k-2]
+    q_axes = list(range(1, 2 * k, 2))   # [1, 3, 5, ..., 2k-1]
+    perm = m_axes + q_axes              # rows first, then cols
+    reconstructed = reconstructed.permute(*perm)    # (m1,...,mk, q1,...,qk)
+
+    # Step 3: reshape to 2-D
+    M = math.prod(m_dims)
+    Q = math.prod(q_dims)
+    reconstructed = reconstructed.reshape(M, Q)
+
+    return reconstructed
