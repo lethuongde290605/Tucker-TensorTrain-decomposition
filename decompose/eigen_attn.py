@@ -290,7 +290,7 @@ def eigenattn(
                             for j in range(args.nsamples):
                                 inps[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids = position_ids, layer_idx = i)[0]
         
-        logger.info(f"layer {i} error:{error} threshold:{args.eigen_attn_params['threshold']} rank_kq: {rank_kq} rank_v: {rank_v} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
+        # logger.info(f"layer {i} error:{error} threshold:{args.eigen_attn_params['threshold']} rank_kq: {rank_kq} rank_v: {rank_v} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
         
     
 
