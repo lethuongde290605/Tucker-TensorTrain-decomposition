@@ -163,6 +163,8 @@ def eigenattn(
                         # M = prod(m_i) = embed_dim,  Q = prod(q_i) < embed_dim
                         new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
 
+                        logger.info(f"New weight {proj} shape: {new_weights[proj].shape}")
+
                     qlayer = OPTTuckerTTDecoderLayer(
                         ori_layer = layer,
                         config    = lm.model.config,
