@@ -77,8 +77,7 @@ def prepare_tensor(t: torch.Tensor, row_factors: list[int], col_factors: list[in
     Returns:
         Tensor of shape (*row_factors, *col_factors).
     """
-    assert len(row_factors) == len(col_factors), \
-        "row_factors and col_factors must have the same length"
+    
     return t.view(*row_factors, *col_factors)
 
 
@@ -220,30 +219,35 @@ def tensor_train_decompose_bias(
     ranks: list[int] | None = None,
 ):
     """
-    Perform TT-matrix decomposition on a 2-D weight matrix.
+    Perform TT-matrix decomposition on a 1-D bias vector.
+
+    The bias vector of shape (R,) is treated as a TT-matrix with col_factors
+    all equal to 1, so each core has shape (r_i, m_i, 1, r_{i+1}).
 
     Args:
-        tensor:      2-D weight matrix of shape (R, C).
-        num_factors: Number of TT-matrix modes (k). Both R and C are each split
-                     into `num_factors` sub-dimensions.
+        tensor:      1-D bias vector of shape (R,).
+        num_factors: Number of TT-matrix modes (k). R is split into
+                     `num_factors` sub-dimensions.
         ranks:       TT-ranks, length k+1, first/last == 1.
                      None -> exact decomposition (uses max ranks).
 
     Returns:
-        factors:  List of k TT-matrix cores shaped (r_i, m_i, n_i, r_{i+1}).
+        factors:  List of k TT-matrix cores shaped (r_i, m_i, 1, r_{i+1}).
         metadata: Dict with keys row_factors, col_factors, original_shape.
     """
     assert tensor.ndim == 1, f"Expected 1-D tensor, got shape {tensor.shape}"
     R = tensor.shape[0]
     print(f"Original Shape: {tensor.shape}")
 
+    # Bias has no column dimension: treat each col sub-dim as 1
     row_factors = factorize_dim(R, num_factors)
-    col_factors = factorize_dim(R, num_factors)
+    col_factors = [1] * num_factors
 
     print(f"Row factors   : {row_factors}  (product={math.prod(row_factors)})")
     print(f"Col factors   : {col_factors}  (product={math.prod(col_factors)})")
 
-    prepared = prepare_tensor(tensor, row_factors, col_factors)
+    # Reshape (R,) -> (*row_factors, 1, 1, ..., 1)
+    prepared = tensor.view(*row_factors, *col_factors)
     print(f"Reshaped for TT-matrix: {list(prepared.shape)}")
 
     max_ranks = compute_max_ranks(row_factors, col_factors)

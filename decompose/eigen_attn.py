@@ -4,9 +4,10 @@ import copy
 import gc
 
 from decompose.eigen_attn_utils import (decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer,
-                                         tucker_decompose_opt_layer, tensor_train_decompose_opt_layer,
+                                         tensor_train_decompose_opt_layer,
                                          apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores,
-                                         compress_bias, tensor_train_decompose_opt_layer_bias)
+                                        tensor_train_decompose_opt_layer_bias)
+from decompose.tucker_utils import tucker_decompose_opt_layer
 from models.decompose_modules import (OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer,
                                       OPTTuckerTTDecoderLayer)
 

@@ -479,7 +479,7 @@ def decompose_llama_layer(layer, fp_inps, args, num_heads, layer_id, attention_m
     return basis_kq, eval_kq, basis_v, eval_v
 
 
-def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compression_ratio=0.7):
+def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, num_factors=5, compression_ratio=0.7):
     """
     Decompose the Q, K, V activation tensors of an OPT attention layer
     using Partial Tucker decomposition (via tucker_utils helpers).
@@ -508,7 +508,7 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compre
     print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}")
 
     # Factorize the feature dimension into 5 sub-dimensions
-    dim1_factors = factorize_dim(tensor_q.shape[2], count=5)
+    dim1_factors = factorize_dim(tensor_q.shape[2], count=num_factors)
     print(f"Dim-1 factors ({tensor_q.shape[2]} -> {dim1_factors})")
 
     tensor_q = prepare_tensor(tensor_q, dim1_factors)
@@ -745,36 +745,3 @@ def reconstruct_combined_tt_cores(new_cores: list) -> torch.Tensor:
     reconstructed = reconstructed.reshape(M, Q)
 
     return reconstructed
-
-
-def compress_bias(tucker_factors: list, bias: torch.Tensor) -> torch.Tensor:
-    """
-    Treat bias (embed_dim,) like a TT-vector, apply Tucker same as W.
-    
-    bias:           (embed_dim,)
-    tucker_factors: [F_i: (m_i, q_i)]  — same Tucker factors used for W
-    row_factors:    [m1, m2, m3, m4, m5]  — same row factorization as W
-    """
-    row_factors = 
-    # Step 1: reshape to multi-dim TT-vector format
-    b = bias.reshape(*row_factors).to(torch.float32)
-    # shape: (m1, m2, m3, m4, m5)
-
-    # Step 2: TT-vector decompose
-    from tensorly.decomposition._tt import tensor_train_matrix
-    tt_cores = tensor_train_matrix(b, rank=[1, None, None, None, None, 1])
-    # cores[i]: (r_i, m_i, r_{i+1})
-
-    # Step 3: Apply Tucker on m_i dimension (parallel với n_i của W)
-    new_cores = []
-    for i, (core, F) in enumerate(zip(tt_cores.factors, tucker_factors)):
-        # core: (r_i, m_i, r_{i+1})
-        # F:    (m_i, q_i)
-        new_core = torch.einsum('rmR, mq -> rqR', core, F)
-        # new_core: (r_i, q_i, r_{i+1})
-        new_cores.append(new_core)
-
-    # Step 4: reconstruct → TT-vector → (q1, q2, q3, q4, q5) → flatten
-    from tensorly.tt_matrix import tt_matrix_to_tensor
-    b_comp = tt_matrix_to_tensor(new_cores)  # (q1, q2, q3, q4, q5)
-    return b_comp.reshape(-1)         # (Q,)
