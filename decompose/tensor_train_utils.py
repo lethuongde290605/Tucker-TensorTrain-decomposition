@@ -214,6 +214,67 @@ def tensor_train_decompose(
     return factors, metadata
 
 
+def tensor_train_decompose_bias(
+    tensor: torch.Tensor,
+    num_factors: int = 5,
+    ranks: list[int] | None = None,
+):
+    """
+    Perform TT-matrix decomposition on a 2-D weight matrix.
+
+    Args:
+        tensor:      2-D weight matrix of shape (R, C).
+        num_factors: Number of TT-matrix modes (k). Both R and C are each split
+                     into `num_factors` sub-dimensions.
+        ranks:       TT-ranks, length k+1, first/last == 1.
+                     None -> exact decomposition (uses max ranks).
+
+    Returns:
+        factors:  List of k TT-matrix cores shaped (r_i, m_i, n_i, r_{i+1}).
+        metadata: Dict with keys row_factors, col_factors, original_shape.
+    """
+    assert tensor.ndim == 1, f"Expected 1-D tensor, got shape {tensor.shape}"
+    R = tensor.shape[0]
+    print(f"Original Shape: {tensor.shape}")
+
+    row_factors = factorize_dim(R, num_factors)
+    col_factors = factorize_dim(R, num_factors)
+
+    print(f"Row factors   : {row_factors}  (product={math.prod(row_factors)})")
+    print(f"Col factors   : {col_factors}  (product={math.prod(col_factors)})")
+
+    prepared = prepare_tensor(tensor, row_factors, col_factors)
+    print(f"Reshaped for TT-matrix: {list(prepared.shape)}")
+
+    max_ranks = compute_max_ranks(row_factors, col_factors)
+    expected_rank_len = num_factors + 1
+
+    if ranks is None:
+        target_ranks = max_ranks
+
+    elif isinstance(ranks, list) and len(ranks) == expected_rank_len:
+        target_ranks = ranks
+
+    else:
+        raise ValueError(
+            f"ranks must be None (exact) or a list of {expected_rank_len} elements "
+            f"[1, r1, ..., r{num_factors - 1}, 1]. Max ranks: {max_ranks}"
+        )
+
+    print(f"Max Ranks              : {max_ranks}")
+    print(f"Target Ranks (TT-Ranks): {target_ranks}")
+
+    factors = run_tensor_train_matrix(prepared, target_ranks)
+    # Cores are already (r_i, m_i, n_i, r_{i+1}) — no reshape needed
+    print(f"Factor shapes: {[list(f.shape) for f in factors]}")
+
+    metadata = {
+        "row_factors": row_factors,
+        "col_factors": col_factors,
+        "original_shape": (R,),
+    }
+    return factors, metadata
+
 def tensor_train_reconstruct(
     factors: list[torch.Tensor],
     metadata: dict,

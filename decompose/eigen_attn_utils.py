@@ -598,6 +598,62 @@ def tensor_train_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, 
     return results
 
 
+def tensor_train_decompose_opt_layer_bias(layer, fp_inps, args, num_heads, layer_id, ranks=None, num_factors=5):
+    """
+    Decompose the Q, K, V bias matrices of an OPT attention layer
+    using Tensor-Train decomposition (via tensor_train_utils helpers).
+
+    Args:
+        layer:       Transformer layer containing self_attn.{q,k,v}_proj.weight.
+        fp_inps:     Full-precision calibration inputs (unused, kept for API consistency).
+        args:        Argument namespace (unused, kept for API consistency).
+        num_heads:   Number of attention heads (unused, kept for API consistency).
+        layer_id:    Layer index (unused, kept for API consistency).
+        ranks:       TT-ranks.  None -> exact decomposition (uses max ranks).
+                     Must be a list of length (num_factors + 1) with first/last == 1.
+        num_factors: Number of TT-modes to split each weight dimension into.
+
+    Returns:
+        Dict with keys "Q", "K", "V", each mapping to a sub-dict containing
+        "factors", "metadata", and "compression_ratio".
+    """
+    from decompose.tensor_train_utils import tensor_train_decompose_bias
+
+    b_q = layer.self_attn.q_proj.bias.data
+    b_k = layer.self_attn.k_proj.bias.data
+    b_v = layer.self_attn.v_proj.bias.data
+    print(f"Original Shape - Q: {b_q.shape}, K: {b_k.shape}, V: {b_v.shape}")
+
+    results = {}
+    for name, weight in (("Q", b_q), ("K", b_k), ("V", b_v)):
+        print(f"\n--- {name} ---")
+        factors, metadata = tensor_train_decompose_bias(
+            weight, num_factors=num_factors, ranks=ranks
+        )
+
+        # Compression stats
+        original_size = weight.numel()
+        compressed_size = sum(f.numel() for f in factors)
+        compression_ratio = compressed_size / original_size
+        print(f"  Compression ratio: {compression_ratio:.4f}  ({compression_ratio * 100:.2f} %)")
+
+        results[name] = {
+            "factors": factors,
+            "metadata": metadata,
+            "compression_ratio": compression_ratio,
+        }
+
+    # Summary
+    print("\n--- Summary ---")
+    for name in ("Q", "K", "V"):
+        r = results[name]
+        print(
+            f"  {name} | factors={[list(f.shape) for f in r['factors']]}"
+            f"  comp_ratio={r['compression_ratio']:.4f}"
+        )
+
+    return results
+
 def apply_tucker_factors_to_tt_cores(
     tucker_factors: list,
     tt_cores: list,
@@ -691,7 +747,7 @@ def reconstruct_combined_tt_cores(new_cores: list) -> torch.Tensor:
     return reconstructed
 
 
-def compress_bias(bias: torch.Tensor, tucker_factors: list) -> torch.Tensor:
+def compress_bias(tucker_factors: list, bias: torch.Tensor) -> torch.Tensor:
     """
     Treat bias (embed_dim,) like a TT-vector, apply Tucker same as W.
     
@@ -699,6 +755,7 @@ def compress_bias(bias: torch.Tensor, tucker_factors: list) -> torch.Tensor:
     tucker_factors: [F_i: (m_i, q_i)]  — same Tucker factors used for W
     row_factors:    [m1, m2, m3, m4, m5]  — same row factorization as W
     """
+    row_factors = 
     # Step 1: reshape to multi-dim TT-vector format
     b = bias.reshape(*row_factors).to(torch.float32)
     # shape: (m1, m2, m3, m4, m5)

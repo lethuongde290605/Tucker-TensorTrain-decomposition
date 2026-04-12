@@ -6,8 +6,7 @@ import gc
 from decompose.eigen_attn_utils import (decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer,
                                          tucker_decompose_opt_layer, tensor_train_decompose_opt_layer,
                                          apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores,
-                                         compress_bias)
-from decompose.tucker_utils import tucker_decompose_opt_layer
+                                         compress_bias, tensor_train_decompose_opt_layer_bias)
 from models.decompose_modules import (OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer,
                                       OPTTuckerTTDecoderLayer)
 
@@ -145,39 +144,31 @@ def eigenattn(
                     error = 0.0
                     num_heads = lm.model.config.num_attention_heads
                     # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
-                    tucker       = tucker_decompose_opt_layer(layer, inps, args, num_heads, i)
-                    tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i)
-
+                    tucker       = tucker_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
+                    tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
+                    tensor_train_bias = tensor_train_decompose_opt_layer_bias(layer, inps, args, num_heads, i, num_factors=5)
                     # ---- build compressed Q / K / V weight matrices --------
                     # tucker["Q/K/V"]["factors"]       : list of k Tucker factor matrices (n_i, q_i)
                     # tensor_train["Q/K/V"]["factors"] : list of k TT-matrix cores (r_i, m_i, n_i, r_{i+1})
                     new_weights = {}
                     new_bias = {}
-                    proj_to_bias = {
-                        "Q": layer.self_attn.q_proj.bias,   # (embed_dim,) hoặc None
-                        "K": layer.self_attn.k_proj.bias,
-                        "V": layer.self_attn.v_proj.bias,
-                    }
+                    
                     for proj in ("Q", "K", "V"):
                         tucker_factors = tucker[proj]["factors"]
                         tt_cores       = tensor_train[proj]["factors"]
+                        tt_cores_bias  = tensor_train_bias[proj]["factors"]
 
                         # mode-multiply Tucker factors into TT cores
                         # new core shape: (r_i, m_i, q_i, r_{i+1})
                         combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores)
-
+                        combined_cores_bias = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores_bias)
                         # reconstruct compressed 2-D weight: (M, Q)
                         # M = prod(m_i) = embed_dim,  Q = prod(q_i) < embed_dim
                         new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
-
-                        # bias
-                        bias_orig = proj_to_bias[proj]
-                        if bias_orig is not None:
-                            new_bias[proj] = compress_bias(bias_orig.data, tucker_factors)
-                        else:
-                            new_bias[proj] = None
+                        new_bias[proj] = reconstruct_combined_tt_cores(combined_cores_bias)
 
                         logger.info(f"New weight {proj} shape: {new_weights[proj].shape}")
+                        logger.info(f"New bias {proj} shape: {new_bias[proj].shape}")
 
                     qlayer = OPTTuckerTTDecoderLayer(
                         ori_layer = layer,
