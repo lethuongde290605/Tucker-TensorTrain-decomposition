@@ -857,9 +857,6 @@ class LlamaEigenAttnDecoderLayer(nn.Module):
         return outputs
   
 
-# =============================================================================
-# Tucker + TT-matrix combined compressed OPT attention
-# =============================================================================
 
 class OPTTuckerTTAttention(nn.Module):
     """
@@ -882,6 +879,9 @@ class OPTTuckerTTAttention(nn.Module):
         w_q: torch.Tensor,          # compressed Q weight (embed_dim, Q)
         w_k: torch.Tensor,          # compressed K weight (embed_dim, Q)
         w_v: torch.Tensor,          # compressed V weight (embed_dim, Q)
+        b_q: torch.Tensor,          # compressed Q bias (Q,)
+        b_k: torch.Tensor,          # compressed K bias (Q,)
+        b_v: torch.Tensor,          # compressed V bias (Q,)
         embed_dim: int,
         num_heads: int,
         dropout: float = 0.0,
@@ -915,15 +915,10 @@ class OPTTuckerTTAttention(nn.Module):
 
         # Copy original biases if they exist; zero otherwise
         if bias:
-            self.q_proj.bias.data.zero_()
-            self.k_proj.bias.data.zero_()
-            self.v_proj.bias.data.zero_()
-            if org_module.q_proj.bias is not None:
-                # Bias lives in the original (embed_dim,) space — keep as-is
-                # but our output is compressed_dim, so we zero-initialise and
-                # leave the user to apply bias correction separately if needed.
-                pass
-
+            self.q_proj.bias.data = b_q
+            self.k_proj.bias.data = b_k
+            self.v_proj.bias.data = b_v
+            
         # Up-projection: compressed_dim -> embed_dim  (absorbs original out_proj weight)
         self.out_proj_up = nn.Linear(self.compressed_dim, embed_dim, bias=bias)
         org_weight_out = org_module.out_proj.weight   # (embed_dim, embed_dim)
@@ -1057,15 +1052,21 @@ class OPTTuckerTTDecoderLayer(nn.Module):
         w_q:       Compressed Q weight tensor of shape (embed_dim, Q).
         w_k:       Compressed K weight tensor of shape (embed_dim, Q).
         w_v:       Compressed V weight tensor of shape (embed_dim, Q).
+        b_q:       Compressed Q bias tensor of shape (Q,).
+        b_k:       Compressed K bias tensor of shape (Q,).
+        b_v:       Compressed V bias tensor of shape (Q,).
     """
 
     def __init__(
         self,
-        ori_layer,
+        ori_layer, 
         config,
         w_q: torch.Tensor,
         w_k: torch.Tensor,
         w_v: torch.Tensor,
+        b_q: torch.Tensor,
+        b_k: torch.Tensor,
+        b_v: torch.Tensor,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -1075,6 +1076,9 @@ class OPTTuckerTTDecoderLayer(nn.Module):
             w_q         = w_q,
             w_k         = w_k,
             w_v         = w_v,
+            b_q         = b_q,
+            b_k         = b_k,
+            b_v         = b_v,
             embed_dim   = self.embed_dim,
             num_heads   = config.num_attention_heads,
             dropout     = config.attention_dropout,

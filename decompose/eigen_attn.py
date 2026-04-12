@@ -5,7 +5,8 @@ import gc
 
 from decompose.eigen_attn_utils import (decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer,
                                          tucker_decompose_opt_layer, tensor_train_decompose_opt_layer,
-                                         apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores)
+                                         apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores,
+                                         compress_bias)
 from decompose.tucker_utils import tucker_decompose_opt_layer
 from models.decompose_modules import (OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer,
                                       OPTTuckerTTDecoderLayer)
@@ -151,6 +152,12 @@ def eigenattn(
                     # tucker["Q/K/V"]["factors"]       : list of k Tucker factor matrices (n_i, q_i)
                     # tensor_train["Q/K/V"]["factors"] : list of k TT-matrix cores (r_i, m_i, n_i, r_{i+1})
                     new_weights = {}
+                    new_bias = {}
+                    proj_to_bias = {
+                        "Q": layer.self_attn.q_proj.bias,   # (embed_dim,) hoặc None
+                        "K": layer.self_attn.k_proj.bias,
+                        "V": layer.self_attn.v_proj.bias,
+                    }
                     for proj in ("Q", "K", "V"):
                         tucker_factors = tucker[proj]["factors"]
                         tt_cores       = tensor_train[proj]["factors"]
@@ -163,6 +170,13 @@ def eigenattn(
                         # M = prod(m_i) = embed_dim,  Q = prod(q_i) < embed_dim
                         new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
 
+                        # bias
+                        bias_orig = proj_to_bias[proj]
+                        if bias_orig is not None:
+                            new_bias[proj] = compress_bias(bias_orig.data, tucker_factors)
+                        else:
+                            new_bias[proj] = None
+
                         logger.info(f"New weight {proj} shape: {new_weights[proj].shape}")
 
                     qlayer = OPTTuckerTTDecoderLayer(
@@ -171,6 +185,9 @@ def eigenattn(
                         w_q       = new_weights["Q"],
                         w_k       = new_weights["K"],
                         w_v       = new_weights["V"],
+                        b_q       = new_bias["Q"],
+                        b_k       = new_bias["K"],
+                        b_v       = new_bias["V"],
                     ).to(dev)
                     '''
                     return tensor_train

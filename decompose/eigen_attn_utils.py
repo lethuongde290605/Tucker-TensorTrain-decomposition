@@ -4,8 +4,9 @@ import numpy as np
 import os
 import scipy
 import tensorly
-from tensorly.decomposition import tensor_train
 from tensorly.tt_tensor import tt_to_tensor
+from tensorly.tt_matrix import tt_matrix_to_tensor
+import math
 tensorly.set_backend('pytorch')
 
 
@@ -665,8 +666,6 @@ def reconstruct_combined_tt_cores(new_cores: list) -> torch.Tensor:
     Returns:
         2-D tensor of shape (M, Q) where M = prod(m_i) and Q = prod(q_i).
     """
-    from tensorly.tt_matrix import tt_matrix_to_tensor
-    import math
 
     k = len(new_cores)
 
@@ -690,3 +689,35 @@ def reconstruct_combined_tt_cores(new_cores: list) -> torch.Tensor:
     reconstructed = reconstructed.reshape(M, Q)
 
     return reconstructed
+
+
+def compress_bias(bias: torch.Tensor, tucker_factors: list) -> torch.Tensor:
+    """
+    Treat bias (embed_dim,) like a TT-vector, apply Tucker same as W.
+    
+    bias:           (embed_dim,)
+    tucker_factors: [F_i: (m_i, q_i)]  — same Tucker factors used for W
+    row_factors:    [m1, m2, m3, m4, m5]  — same row factorization as W
+    """
+    # Step 1: reshape to multi-dim TT-vector format
+    b = bias.reshape(*row_factors).to(torch.float32)
+    # shape: (m1, m2, m3, m4, m5)
+
+    # Step 2: TT-vector decompose
+    from tensorly.decomposition._tt import tensor_train_matrix
+    tt_cores = tensor_train_matrix(b, rank=[1, None, None, None, None, 1])
+    # cores[i]: (r_i, m_i, r_{i+1})
+
+    # Step 3: Apply Tucker on m_i dimension (parallel với n_i của W)
+    new_cores = []
+    for i, (core, F) in enumerate(zip(tt_cores.factors, tucker_factors)):
+        # core: (r_i, m_i, r_{i+1})
+        # F:    (m_i, q_i)
+        new_core = torch.einsum('rmR, mq -> rqR', core, F)
+        # new_core: (r_i, q_i, r_{i+1})
+        new_cores.append(new_core)
+
+    # Step 4: reconstruct → TT-vector → (q1, q2, q3, q4, q5) → flatten
+    from tensorly.tt_matrix import tt_matrix_to_tensor
+    b_comp = tt_matrix_to_tensor(new_cores)  # (q1, q2, q3, q4, q5)
+    return b_comp.reshape(-1)         # (Q,)
