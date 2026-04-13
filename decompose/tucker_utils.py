@@ -153,7 +153,7 @@ def _rank_imbalance(dims: list[int], ranks: list[int]) -> float:
 # Rank calculation
 # ---------------------------------------------------------------------------
 
-def calculate_rank(tensor_shape: tuple, modes: list[int], target_ratio: float) -> list[int]:
+def calculate_rank(tensor_shape: tuple, modes: list[int], target_ratio: float, num_head: int) -> list[int]:
     """
     Find Tucker ranks for the given modes such that the compression rate
     (size_core + size_factors) / size_original is as close as possible to
@@ -175,6 +175,7 @@ def calculate_rank(tensor_shape: tuple, modes: list[int], target_ratio: float) -
         modes:        List of mode indices to decompose (e.g. [1, 2, 3, 4, 5]).
         target_ratio: Target compression rate in (0, 1].
                       compression_rate = (size_core + size_factors) / size_tensor
+        num_head:     The product of the resulting ranks must be divisible by this value.
 
     Returns:
         A list of ranks, one per entry in `modes`, whose compression rate is
@@ -214,15 +215,21 @@ def calculate_rank(tensor_shape: tuple, modes: list[int], target_ratio: float) -
 
         new_rate, _, idx, new_ranks = best
 
-        # Stop if this step does not improve the rate
-        if new_rate >= best_rate:
+        # Tính tích các phần tử trong new_ranks để kiểm tra ràng buộc
+        prod_ranks = 1
+        for r in new_ranks:
+            prod_ranks *= r
+
+        # Stop if this step does not improve the rate AND constraints are met
+        if new_rate >= best_rate and prod_ranks % num_head == 0:
             break
 
         ranks = new_ranks
         best_rate = new_rate
         best_ranks = ranks.copy()
 
-        if best_rate <= target_ratio:
+        # Stop if target ratio is reached AND the product is divisible by num_head
+        if best_rate <= target_ratio and prod_ranks % num_head == 0:
             break
 
     print(f"  Target compression ratio : {target_ratio:.4f}")
@@ -384,7 +391,7 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compre
     print(f"Tensor shape after prepare_tensor: {tensor_q.shape}")
 
     modes = list(range(1, tensor_q.ndim))
-    rank = calculate_rank(tensor_q.shape, modes, compression_ratio)
+    rank = calculate_rank(tensor_q.shape, modes, compression_ratio, num_heads)
     print(f"Target Ranks: {rank}")
 
     named_tensors = {"Q": tensor_q, "K": tensor_k, "V": tensor_v}
