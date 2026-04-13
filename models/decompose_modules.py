@@ -860,28 +860,29 @@ class LlamaEigenAttnDecoderLayer(nn.Module):
 
 class OPTTuckerTTAttention(nn.Module):
     """
-    OPT self-attention that uses pre-computed Tucker+TT-matrix compressed
-    weight matrices for Q, K, V projections.
+    OPT self-attention with Tucker+TT-matrix compressed Q/K/V projections.
 
-    The compressed weights have shape (embed_dim, compressed_dim) where
-    compressed_dim = Q = prod(Tucker ranks) < embed_dim.
+    Weight shapes after Tucker+TT compression:
+      w_q / w_k / w_v : (embed_dim, Q)  where Q = prod(Tucker ranks) < embed_dim
+      b_q / b_k / b_v : (Q,)            Tucker-projected bias
 
-    Each head operates on compressed_dim // num_heads features instead of
-    the original head_dim = embed_dim // num_heads.
+    Each projection maps embed_dim → Q, so K/V cache stores (seq_len, Q//H)
+    per head instead of (seq_len, head_dim), giving the cache compression.
 
-    The out_proj_up layer maps the compressed attention output back to
-    embed_dim before adding the residual.
+    out_proj_up maps Q → embed_dim using  W_out @ U_kron_v  where U_kron_v is
+    the Kronecker product of the Tucker V-factors (reconstructs the V subspace).
     """
 
     def __init__(
         self,
-        org_module: nn.Module,      # original self_attn module
-        w_q: torch.Tensor,          # compressed Q weight (embed_dim, Q)
-        w_k: torch.Tensor,          # compressed K weight (embed_dim, Q)
-        w_v: torch.Tensor,          # compressed V weight (embed_dim, Q)
-        b_q: torch.Tensor,          # compressed Q bias (Q,)
-        b_k: torch.Tensor,          # compressed K bias (Q,)
-        b_v: torch.Tensor,          # compressed V bias (Q,)
+        org_module: nn.Module,        # original self_attn module
+        w_q: torch.Tensor,            # Tucker+TT weight, shape (embed_dim, Q)
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        b_q: torch.Tensor,            # Tucker-projected bias, shape (Q,)
+        b_k: torch.Tensor,
+        b_v: torch.Tensor,
+        tucker_factors_v: list,       # Tucker factors for V: [U_i (n_i, q_i)]
         embed_dim: int,
         num_heads: int,
         dropout: float = 0.0,
@@ -891,50 +892,61 @@ class OPTTuckerTTAttention(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.dropout = dropout
+        self.dropout   = dropout
 
-        # Compressed output dimension (Tucker-reduced)
         assert w_q.shape == w_k.shape == w_v.shape, (
             f"w_q, w_k, w_v must have the same shape, "
             f"got {w_q.shape}, {w_k.shape}, {w_v.shape}"
         )
-        self.compressed_dim = w_q.shape[1]           # Q
-        self.head_dim = self.compressed_dim // num_heads
-        self.scaling = self.head_dim ** -0.5
-        self.is_decoder = is_decoder
+        # Q = prod(Tucker ranks), the Tucker-compressed output dim
+        self.compressed_dim = w_q.shape[1]
+        assert self.compressed_dim % num_heads == 0, (
+            f"compressed_dim (Q={self.compressed_dim}) must be divisible by "
+            f"num_heads={num_heads}. Each head will work on Q//H dims.\n"
+            f"Hint: adjust Tucker compression ratio so that prod(ranks) % {num_heads} == 0."
+        )
+        # head_dim changes: Q//H instead of embed_dim//H — this is intentional,
+        # the scaling adjusts accordingly and attention still works correctly.
+        self.head_dim       = self.compressed_dim // num_heads
+        self.scaling        = self.head_dim ** -0.5
+        self.is_decoder     = is_decoder
 
-        # Q / K / V projections: embed_dim -> compressed_dim
+        # Q / K / V projections:  embed_dim → compressed_dim (Q)
+        # K/V cache will store (seq_len, Q//H) per head — compressed!
         self.q_proj = nn.Linear(embed_dim, self.compressed_dim, bias=bias)
         self.k_proj = nn.Linear(embed_dim, self.compressed_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, self.compressed_dim, bias=bias)
 
-        # Load compressed weights (transposed: Linear expects (out, in))
-        self.q_proj.weight.data = w_q.t().contiguous()
+        # Load compressed weights; nn.Linear stores weight as (out, in)
+        self.q_proj.weight.data = w_q.t().contiguous()   # (Q, embed_dim)
         self.k_proj.weight.data = w_k.t().contiguous()
         self.v_proj.weight.data = w_v.t().contiguous()
 
-        # Copy original biases if they exist; zero otherwise
         if bias:
-            self.q_proj.bias.data = b_q
+            self.q_proj.bias.data = b_q   # (Q,)
             self.k_proj.bias.data = b_k
             self.v_proj.bias.data = b_v
-            
-        # Up-projection: compressed_dim -> embed_dim  (absorbs original out_proj weight)
+
+        # ---- out_proj_up:  Q → embed_dim -----------------------------------------
+        # V' is in Tucker-compressed Q-space.  To recover the original V subspace:
+        #   V_approx = U_kron_v @ V'   where  U_kron_v = U_1 ⊗ U_2 ⊗ ... ⊗ U_k
+        # Then the output projection:
+        #   y = W_out @ V_approx = (W_out @ U_kron_v) @ V'
+        # so  out_proj_up.weight = W_out @ U_kron_v
         self.out_proj_up = nn.Linear(self.compressed_dim, embed_dim, bias=bias)
-        org_weight_out = org_module.out_proj.weight   # (embed_dim, embed_dim)
-        # Map compressed values back to embed_dim space via identity-like init:
-        # We cannot exactly recover the original out_proj because the column
-        # space is now Q-dimensional.  We initialise with a least-squares
-        # pseudo-inverse of the Tucker compression direction:
-        # out_proj_up.weight ≈ org_out_proj @ I_{embed_dim→Q}ᵀ
-        # For a neutral starting point we use random init (user trains further)
-        # but if Q == embed_dim we can just copy the weight directly.
-        if self.compressed_dim == embed_dim:
-            self.out_proj_up.weight.data = org_weight_out.clone()
-        else:
-            # Truncate columns to compressed_dim
-            self.out_proj_up.weight.data = org_weight_out[:, :self.compressed_dim].clone()
-        self.out_proj_up.bias = org_module.out_proj.bias
+        org_weight_out   = org_module.out_proj.weight.data   # (embed_dim, embed_dim)
+
+        # Build Kronecker product of V Tucker factors: U_kron_v shape (embed_dim, Q)
+        U_kron_v = tucker_factors_v[0].float()
+        for U in tucker_factors_v[1:]:
+            U_kron_v = torch.kron(U_kron_v, U.float())
+        # U_kron_v: (embed_dim, Q)  →  W_out @ U_kron_v: (embed_dim, Q)
+        self.out_proj_up.weight.data = (
+            org_weight_out.float() @ U_kron_v
+        ).to(org_weight_out.dtype).contiguous()  # (embed_dim, Q)
+
+        if bias:
+            self.out_proj_up.bias.data = org_module.out_proj.bias.data.clone()
 
     # ------------------------------------------------------------------
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -1044,22 +1056,20 @@ class OPTTuckerTTAttention(nn.Module):
 
 class OPTTuckerTTDecoderLayer(nn.Module):
     """
-    OPT decoder layer that uses Tucker+TT-matrix compressed Q/K/V weights.
+    OPT decoder layer with Tucker+TT-matrix compressed Q/K/V weights.
 
     Args:
-        ori_layer: Original OPTDecoderLayer (used for norms, FFN, out_proj).
-        config:    OPT model config.
-        w_q:       Compressed Q weight tensor of shape (embed_dim, Q).
-        w_k:       Compressed K weight tensor of shape (embed_dim, Q).
-        w_v:       Compressed V weight tensor of shape (embed_dim, Q).
-        b_q:       Compressed Q bias tensor of shape (Q,).
-        b_k:       Compressed K bias tensor of shape (Q,).
-        b_v:       Compressed V bias tensor of shape (Q,).
+        ori_layer:        Original OPTDecoderLayer.
+        config:           OPT model config.
+        w_q/w_k/w_v:      Compressed weight tensors, shape (embed_dim, Q).
+        b_q/b_k/b_v:      Tucker-projected bias tensors, shape (Q,).
+        tucker_factors_v: Tucker factor matrices for V, list of (n_i, q_i).
+                          Used to initialise out_proj_up correctly.
     """
 
     def __init__(
         self,
-        ori_layer, 
+        ori_layer,
         config,
         w_q: torch.Tensor,
         w_k: torch.Tensor,
@@ -1067,23 +1077,25 @@ class OPTTuckerTTDecoderLayer(nn.Module):
         b_q: torch.Tensor,
         b_k: torch.Tensor,
         b_v: torch.Tensor,
+        tucker_factors_v: list,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
 
         self.self_attn = OPTTuckerTTAttention(
-            org_module  = ori_layer.self_attn,
-            w_q         = w_q,
-            w_k         = w_k,
-            w_v         = w_v,
-            b_q         = b_q,
-            b_k         = b_k,
-            b_v         = b_v,
-            embed_dim   = self.embed_dim,
-            num_heads   = config.num_attention_heads,
-            dropout     = config.attention_dropout,
-            is_decoder  = True,
-            bias        = config.enable_bias,
+            org_module       = ori_layer.self_attn,
+            w_q              = w_q,
+            w_k              = w_k,
+            w_v              = w_v,
+            b_q              = b_q,
+            b_k              = b_k,
+            b_v              = b_v,
+            tucker_factors_v = tucker_factors_v,
+            embed_dim        = self.embed_dim,
+            num_heads        = config.num_attention_heads,
+            dropout          = config.attention_dropout,
+            is_decoder       = True,
+            bias             = config.enable_bias,
         )
 
         self.do_layer_norm_before = config.do_layer_norm_before

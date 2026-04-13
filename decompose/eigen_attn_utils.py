@@ -654,6 +654,47 @@ def tensor_train_decompose_opt_layer_bias(layer, fp_inps, args, num_heads, layer
 
     return results
 
+
+def project_bias_with_tucker_factors(
+    bias: torch.Tensor,
+    tucker_factors: list,
+) -> torch.Tensor:
+    """
+    Project a 1-D bias vector from the original output space (N,) into the
+    Tucker-compressed output space (Q,) by applying each Tucker factor as a
+    mode-wise contraction.
+
+    Given Tucker factors U_i of shape (n_i, q_i) that compress the output
+    activation, the compressed bias is:
+
+        b_new[q_1,...,q_k] = sum_{n_1,...,n_k} b[n_1,...,n_k] * U_1[n_1,q_1]
+                                                              * ... * U_k[n_k,q_k]
+
+    This is the Tucker multi-mode product of the reshaped bias with all factors.
+
+    Args:
+        bias:           1-D bias vector of shape (N,) where N = prod(n_i).
+        tucker_factors: List of k factor matrices, each of shape (n_i, q_i).
+
+    Returns:
+        Compressed bias of shape (Q,) where Q = prod(q_i).
+    """
+    n_factors = [f.shape[0] for f in tucker_factors]
+    result = bias.to(torch.float32).view(*n_factors)  # (n1, n2, ..., nk)
+
+    for mode, U in enumerate(tucker_factors):
+        # Contract mode `mode` of result with dim-0 of U: (nᵢ, qᵢ)
+        result = torch.tensordot(result, U, dims=([mode], [0]))
+        # tensordot puts the contracted-out dimension at the END.
+        # Permute it back to position `mode`.
+        k = len(result.shape)                              # k unchanged
+        perm = list(range(mode)) + [k - 1] + list(range(mode, k - 1))
+        result = result.permute(*perm).contiguous()
+        # result is now (q_0,...,q_{mode}, n_{mode+1},...,n_{k-1})
+
+    return result.reshape(-1)   # (Q,)
+
+
 def apply_tucker_factors_to_tt_cores(
     tucker_factors: list,
     tt_cores: list,

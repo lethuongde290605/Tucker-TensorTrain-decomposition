@@ -6,6 +6,7 @@ import gc
 from decompose.eigen_attn_utils import (decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer,
                                          tensor_train_decompose_opt_layer,
                                          apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores,
+                                         project_bias_with_tucker_factors,
                                         tensor_train_decompose_opt_layer_bias)
 from decompose.tucker_utils import tucker_decompose_opt_layer
 from models.decompose_modules import (OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer,
@@ -147,39 +148,43 @@ def eigenattn(
                     # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
                     tucker       = tucker_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
                     tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
-                    tensor_train_bias = tensor_train_decompose_opt_layer_bias(layer, inps, args, num_heads, i, num_factors=5)
                     # ---- build compressed Q / K / V weight matrices --------
                     # tucker["Q/K/V"]["factors"]       : list of k Tucker factor matrices (n_i, q_i)
                     # tensor_train["Q/K/V"]["factors"] : list of k TT-matrix cores (r_i, m_i, n_i, r_{i+1})
                     new_weights = {}
-                    new_bias = {}
-                    
+                    new_bias    = {}
+
                     for proj in ("Q", "K", "V"):
                         tucker_factors = tucker[proj]["factors"]
                         tt_cores       = tensor_train[proj]["factors"]
-                        tt_cores_bias  = tensor_train_bias[proj]["factors"]
 
-                        # mode-multiply Tucker factors into TT cores
-                        # new core shape: (r_i, m_i, q_i, r_{i+1})
+                        # Combine Tucker factors into TT-weight cores
+                        # Tucker contracts INPUT dim (nᵢ → qᵢ): new core (rᵢ, mᵢ, qᵢ, rᵢ₊₁)
                         combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores)
-                        combined_cores_bias = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores_bias)
-                        # reconstruct compressed 2-D weight: (M, Q)
-                        # M = prod(m_i) = embed_dim,  Q = prod(q_i) < embed_dim
+
+                        # Reconstruct compressed weight: W_new shape (M=768, Q)
+                        # nn.Linear uses weight.T → effective shape (Q, 768)
+                        # maps input (768,) → output (Q,) ← K/V cache compressed
                         new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
-                        new_bias[proj] = reconstruct_combined_tt_cores(combined_cores_bias)
+
+                        # Compress bias: original b (768,) → b_new (Q,)
+                        # Tucker projects the OUTPUT space, so bias must be projected too.
+                        orig_bias = getattr(layer.self_attn, {"Q": "q_proj", "K": "k_proj", "V": "v_proj"}[proj]).bias.data
+                        new_bias[proj] = project_bias_with_tucker_factors(orig_bias, tucker_factors)
 
                         logger.info(f"New weight {proj} shape: {new_weights[proj].shape}")
                         logger.info(f"New bias {proj} shape: {new_bias[proj].shape}")
 
                     qlayer = OPTTuckerTTDecoderLayer(
-                        ori_layer = layer,
-                        config    = lm.model.config,
-                        w_q       = new_weights["Q"],
-                        w_k       = new_weights["K"],
-                        w_v       = new_weights["V"],
-                        b_q       = new_bias["Q"],
-                        b_k       = new_bias["K"],
-                        b_v       = new_bias["V"],
+                        ori_layer        = layer,
+                        config           = lm.model.config,
+                        w_q              = new_weights["Q"],
+                        w_k              = new_weights["K"],
+                        w_v              = new_weights["V"],
+                        b_q              = new_bias["Q"],
+                        b_k              = new_bias["K"],
+                        b_v              = new_bias["V"],
+                        tucker_factors_v = tucker["V"]["factors"],  # for out_proj_up init
                     ).to(dev)
                     '''
                     return tensor_train
