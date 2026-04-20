@@ -604,7 +604,7 @@ def decompose_llama_layer(layer, fp_inps, args, num_heads, layer_id, attention_m
     return basis_kq, eval_kq, basis_v, eval_v
 
 
-def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, num_factors=5, compression_ratio=0.7):
+def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, num_factors=5, compression_ratio=0.8):
     """
     Decompose the Q, K, V activation tensors of an OPT attention layer
     using Partial Tucker decomposition (via tucker_utils helpers).

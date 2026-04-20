@@ -69,6 +69,7 @@ def layer_shape_report(model):
 
 def generate_text(model, tokenizer, prompt: str, device, max_new_tokens: int = 40) -> str:
     model.eval()
+    # Always send inputs to wherever the model actually lives
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
         output_ids = model.generate(
@@ -81,6 +82,13 @@ def generate_text(model, tokenizer, prompt: str, device, max_new_tokens: int = 4
     generated = output_ids[0, inputs["input_ids"].shape[1]:]
     return tokenizer.decode(generated, skip_special_tokens=True)
 
+
+def model_device(model) -> torch.device:
+    """Return the device of the first parameter in the model."""
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
 
 def load_calib_data(model_path, nsamples, seed, seqlen, cache_dir):
     """Load a tiny wikitext2 calibration batch (same logic as main_eigen_attn.py)."""
@@ -251,11 +259,15 @@ def main():
             print(f"    {name:<16}: {shape}")
 
     # ---- 4. Compressed model generation -------------------------------------
-    print(f"\n[4/4] Compressed model generation ...")
+    # eigenattn() moves layers back to CPU at the end; detect the actual device.
+    infer_device = model_device(compressed_model)
+    print(f"\n[4/4] Compressed model generation (model on {infer_device}) ...")
     compressed_model.config.use_cache = True
+    # Move the full model to the inference device (handles embed_tokens, lm_head, etc.)
+    compressed_model = compressed_model.to(infer_device)
     t0 = time.time()
     compressed_text = generate_text(
-        compressed_model, tokenizer, args.prompt, device, args.max_new_tokens
+        compressed_model, tokenizer, args.prompt, infer_device, args.max_new_tokens
     )
     print(f"  Compressed output: {compressed_text!r}")
     print(f"  Time             : {time.time() - t0:.2f}s")
