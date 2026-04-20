@@ -879,9 +879,11 @@ class OPTTuckerTTAttention(nn.Module):
         w_q: torch.Tensor,            # Tucker+TT weight, shape (embed_dim, Q)
         w_k: torch.Tensor,
         w_v: torch.Tensor,
+        w_o: torch.Tensor,            # Tucker+TT weight for out_proj, shape (P, embed_dim)
         b_q: torch.Tensor,            # Tucker-projected bias, shape (Q,)
         b_k: torch.Tensor,
         b_v: torch.Tensor,
+        b_o: torch.Tensor,            # Tucker-projected bias for out_proj, shape (P,)
         tucker_factors_v: list,       # Tucker factors for V: [U_i (n_i, q_i)]
         embed_dim: int,
         num_heads: int,
@@ -927,26 +929,19 @@ class OPTTuckerTTAttention(nn.Module):
             self.k_proj.bias.data = b_k
             self.v_proj.bias.data = b_v
 
-        # ---- out_proj_up:  Q → embed_dim -----------------------------------------
-        # V' is in Tucker-compressed Q-space.  To recover the original V subspace:
-        #   V_approx = U_kron_v @ V'   where  U_kron_v = U_1 ⊗ U_2 ⊗ ... ⊗ U_k
-        # Then the output projection:
-        #   y = W_out @ V_approx = (W_out @ U_kron_v) @ V'
-        # so  out_proj_up.weight = W_out @ U_kron_v
-        self.out_proj_up = nn.Linear(self.compressed_dim, embed_dim, bias=bias)
-        org_weight_out   = org_module.out_proj.weight.data   # (embed_dim, embed_dim)
-
-        # Build Kronecker product of V Tucker factors: U_kron_v shape (embed_dim, Q)
-        U_kron_v = tucker_factors_v[0].float()
-        for U in tucker_factors_v[1:]:
-            U_kron_v = torch.kron(U_kron_v, U.float())
-        # U_kron_v: (embed_dim, Q)  →  W_out @ U_kron_v: (embed_dim, Q)
-        self.out_proj_up.weight.data = (
-            org_weight_out.float() @ U_kron_v
-        ).to(org_weight_out.dtype).contiguous()  # (embed_dim, Q)
+        # ---- out_proj_up: compressed_dim → embed_dim ---------------------------
+        # w_o is the Tucker+TT compressed out_proj weight with shape (P, embed_dim)
+        # where P = prod(Tucker output ranks) is the compressed INPUT dim of out_proj.
+        # We use the Tucker-calibrated weight directly instead of the Kronecker
+        # approximation, so the projection is learned from real activations.
+        out_in_dim  = w_o.shape[0]   # P (compressed input dim of out_proj)
+        out_out_dim = w_o.shape[1]   # embed_dim (output stays uncompressed)
+        self.out_proj_up = nn.Linear(out_in_dim, out_out_dim, bias=bias)
+        # w_o shape: (P, embed_dim) — nn.Linear weight is (out_features, in_features)
+        self.out_proj_up.weight.data = w_o.t().contiguous()   # (embed_dim, P)
 
         if bias:
-            self.out_proj_up.bias.data = org_module.out_proj.bias.data.clone()
+            self.out_proj_up.bias.data = b_o
 
     # ------------------------------------------------------------------
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -1056,15 +1051,16 @@ class OPTTuckerTTAttention(nn.Module):
 
 class OPTTuckerTTDecoderLayer(nn.Module):
     """
-    OPT decoder layer with Tucker+TT-matrix compressed Q/K/V weights.
+    OPT decoder layer with Tucker+TT-matrix compressed Q/K/V/O weights.
 
     Args:
         ori_layer:        Original OPTDecoderLayer.
         config:           OPT model config.
-        w_q/w_k/w_v:      Compressed weight tensors, shape (embed_dim, Q).
-        b_q/b_k/b_v:      Tucker-projected bias tensors, shape (Q,).
-        tucker_factors_v: Tucker factor matrices for V, list of (n_i, q_i).
-                          Used to initialise out_proj_up correctly.
+        w_q/w_k/w_v:      Compressed weight tensors for Q/K/V, shape (embed_dim, Q).
+        w_o:              Compressed weight tensor for out_proj, shape (P, embed_dim).
+        b_q/b_k/b_v:      Tucker-projected bias tensors for Q/K/V, shape (Q,).
+        b_o:              Tucker-projected bias for out_proj, shape (P,).
+        tucker_factors_v: Tucker factor matrices for V (kept for API backward compat).
     """
 
     def __init__(
@@ -1074,9 +1070,11 @@ class OPTTuckerTTDecoderLayer(nn.Module):
         w_q: torch.Tensor,
         w_k: torch.Tensor,
         w_v: torch.Tensor,
+        w_o: torch.Tensor,
         b_q: torch.Tensor,
         b_k: torch.Tensor,
         b_v: torch.Tensor,
+        b_o: torch.Tensor,
         tucker_factors_v: list,
     ):
         super().__init__()
@@ -1087,9 +1085,11 @@ class OPTTuckerTTDecoderLayer(nn.Module):
             w_q              = w_q,
             w_k              = w_k,
             w_v              = w_v,
+            w_o              = w_o,
             b_q              = b_q,
             b_k              = b_k,
             b_v              = b_v,
+            b_o              = b_o,
             tucker_factors_v = tucker_factors_v,
             embed_dim        = self.embed_dim,
             num_heads        = config.num_attention_heads,

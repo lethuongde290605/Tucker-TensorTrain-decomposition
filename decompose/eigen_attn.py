@@ -5,6 +5,7 @@ import gc
 
 from decompose.eigen_attn_utils import (decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer,
                                          tensor_train_decompose_opt_layer,
+                                         tensor_train_decompose_opt_layer_out_proj,
                                          apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores,
                                          project_bias_with_tucker_factors,
                                         tensor_train_decompose_opt_layer_bias)
@@ -148,28 +149,29 @@ def eigenattn(
                     # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
                     tucker       = tucker_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
                     tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
+                    tensor_train_o = tensor_train_decompose_opt_layer_out_proj(layer, inps, args, num_heads, i, num_factors=5)
+                    # Merge O result into the tensor_train dict so the loop below handles all four projections
+                    tensor_train["O"] = tensor_train_o["O"]
                     # ---- build compressed Q / K / V weight matrices --------
                     # tucker["Q/K/V"]["factors"]       : list of k Tucker factor matrices (n_i, q_i)
                     # tensor_train["Q/K/V"]["factors"] : list of k TT-matrix cores (r_i, m_i, n_i, r_{i+1})
                     new_weights = {}
                     new_bias    = {}
 
-                    for proj in ("Q", "K", "V"):
+                    for proj in ("Q", "K", "V", "O"):
                         tucker_factors = tucker[proj]["factors"]
                         tt_cores       = tensor_train[proj]["factors"]
 
-                        # Combine Tucker factors into TT-weight cores
-                        # Tucker contracts INPUT dim (nᵢ → qᵢ): new core (rᵢ, mᵢ, qᵢ, rᵢ₊₁)
                         combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores)
-
-                        # Reconstruct compressed weight: W_new shape (M=768, Q)
-                        # nn.Linear uses weight.T → effective shape (Q, 768)
-                        # maps input (768,) → output (Q,) ← K/V cache compressed
                         new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
 
-                        # Compress bias: original b (768,) → b_new (Q,)
-                        # Tucker projects the OUTPUT space, so bias must be projected too.
-                        orig_bias = getattr(layer.self_attn, {"Q": "q_proj", "K": "k_proj", "V": "v_proj"}[proj]).bias.data
+                        # For Q/K/V the bias comes from the Q/K/V projections;
+                        # for O the bias comes from out_proj.
+                        proj_name_map = {
+                            "Q": "q_proj", "K": "k_proj",
+                            "V": "v_proj", "O": "out_proj",
+                        }
+                        orig_bias = getattr(layer.self_attn, proj_name_map[proj]).bias.data
                         new_bias[proj] = project_bias_with_tucker_factors(orig_bias, tucker_factors)
 
                         logger.info(f"New weight {proj} shape: {new_weights[proj].shape}")
@@ -181,10 +183,12 @@ def eigenattn(
                         w_q              = new_weights["Q"],
                         w_k              = new_weights["K"],
                         w_v              = new_weights["V"],
+                        w_o              = new_weights["O"],
                         b_q              = new_bias["Q"],
                         b_k              = new_bias["K"],
                         b_v              = new_bias["V"],
-                        tucker_factors_v = tucker["V"]["factors"],  # for out_proj_up init
+                        b_o              = new_bias["O"],
+                        tucker_factors_v = tucker["V"]["factors"],
                     ).to(dev)
                     '''
                     return tensor_train

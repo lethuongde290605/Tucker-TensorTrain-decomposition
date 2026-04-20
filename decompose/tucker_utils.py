@@ -361,50 +361,72 @@ def _decompose_one(name: str, tensor, rank: list[int], modes: list[int]) -> dict
 
 def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compression_ratio=0.7, num_factors=5):
     """
-    Decompose the Q, K, V activation tensors of an OPT attention layer
-    using Partial Tucker decomposition.
+    Decompose the Q, K, V, and out_proj-input (O) activation tensors of an OPT
+    attention layer using Partial Tucker decomposition.
 
     Args:
-        layer:             Transformer layer whose Q/K/V projections are hooked.
+        layer:             Transformer layer whose Q/K/V/O projections are hooked.
         fp_inps:           Full-precision calibration inputs.
         args:              Argument namespace (must contain eigen_attn_params).
-        num_heads:         Number of attention heads (unused, kept for API consistency).
-        layer_id:          Layer index (unused, kept for API consistency).
+        num_heads:         Number of attention heads.
+        layer_id:          Layer index (kept for API consistency).
         compression_ratio: Target Tucker compression rate in (0, 1].
+        num_factors:       Number of sub-dimensions to split each feature dim into.
 
     Returns:
-        Dict with keys "Q", "K", "V", each mapping to a sub-dict containing
+        Dict with keys "Q", "K", "V", "O", each mapping to a sub-dict containing
         "core", "factors", "compression_ratio", and "relative_error".
     """
-    # shape returned by get_kqv_opt: (nsamples / avg_dim, seq_len, dim)
-    from decompose.eigen_attn_utils import get_kqv_opt  # lazy import: only needed in real runs
+    from decompose.eigen_attn_utils import get_kqv_opt, get_out_proj_input_opt
+
+    # ---- Q / K / V activations -----------------------------------------------
     tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
     print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}")
 
-    # Factorize the feature dimension into num_factors sub-dimensions
-    dim1_factors = factorize_dim(tensor_q.shape[2], count=num_factors)
-    print(f"Dim-1 factors ({tensor_q.shape[2]} -> {dim1_factors})")
+    # ---- O (input to out_proj / W_o) activations ------------------------------
+    tensor_o = get_out_proj_input_opt(layer, fp_inps, args)
+    print(f"Original Shape - O (out_proj input): {tensor_o.shape}")
 
-    tensor_q = prepare_tensor(tensor_q, dim1_factors)
-    tensor_k = prepare_tensor(tensor_k, dim1_factors)
-    tensor_v = prepare_tensor(tensor_v, dim1_factors)
-    print(f"Tensor shape after prepare_tensor: {tensor_q.shape}")
+    # Factorize the feature dimension into num_factors sub-dimensions.
+    # Q/K/V all share the same feature dim (head_dim * num_heads).
+    # O has the same embed_dim in standard OPT, so we can reuse dim1_factors;
+    # but we compute it separately in case the dim differs (e.g. GQA variants).
+    dim1_factors_qkv = factorize_dim(tensor_q.shape[2], count=num_factors)
+    print(f"Dim-1 factors QKV ({tensor_q.shape[2]} -> {dim1_factors_qkv})")
 
-    modes = list(range(1, tensor_q.ndim))
-    rank = calculate_rank(tensor_q.shape, modes, compression_ratio, num_heads)
-    print(f"Target Ranks: {rank}")
+    dim1_factors_o = factorize_dim(tensor_o.shape[2], count=num_factors)
+    print(f"Dim-1 factors O   ({tensor_o.shape[2]} -> {dim1_factors_o})")
 
-    named_tensors = {"Q": tensor_q, "K": tensor_k, "V": tensor_v}
+    tensor_q = prepare_tensor(tensor_q, dim1_factors_qkv)
+    tensor_k = prepare_tensor(tensor_k, dim1_factors_qkv)
+    tensor_v = prepare_tensor(tensor_v, dim1_factors_qkv)
+    tensor_o = prepare_tensor(tensor_o, dim1_factors_o)
+    print(f"Tensor shape after prepare_tensor: Q={tensor_q.shape}, O={tensor_o.shape}")
+
+    # Tucker ranks
+    modes_qkv = list(range(1, tensor_q.ndim))
+    rank_qkv  = calculate_rank(tensor_q.shape, modes_qkv, compression_ratio, num_heads)
+    print(f"Target Ranks QKV: {rank_qkv}")
+
+    modes_o = list(range(1, tensor_o.ndim))
+    rank_o  = calculate_rank(tensor_o.shape, modes_o, compression_ratio, num_heads)
+    print(f"Target Ranks O  : {rank_o}")
+
+    # Decompose
+    named_tensors_qkv = {"Q": tensor_q, "K": tensor_k, "V": tensor_v}
     results = {
-        name: _decompose_one(name, tensor, rank, modes)
-        for name, tensor in named_tensors.items()
+        name: _decompose_one(name, tensor, rank_qkv, modes_qkv)
+        for name, tensor in named_tensors_qkv.items()
     }
+    results["O"] = _decompose_one("O", tensor_o, rank_o, modes_o)
 
     # Summary
     print("\n--- Summary ---")
-    print(f"  Core Q shape   : {results['Q']['core'].shape}")
+    print(f"  Core Q shape    : {results['Q']['core'].shape}")
     print(f"  Factors Q shapes: {[f.shape for f in results['Q']['factors']]}")
-    for name in ("Q", "K", "V"):
+    print(f"  Core O shape    : {results['O']['core'].shape}")
+    print(f"  Factors O shapes: {[f.shape for f in results['O']['factors']]}")
+    for name in ("Q", "K", "V", "O"):
         print(
             f"  {name} | rel_err={results[name]['relative_error']:.6f}"
             f"  comp_ratio={results[name]['compression_ratio']:.4f}"

@@ -396,6 +396,131 @@ def get_attn_output_opt(layer, fp_inps, args):
 
 
 @torch.no_grad()
+def get_out_proj_input_opt(layer, fp_inps, args):
+    """
+    Capture the *input* activations fed into the out_proj (W_o) linear layer
+    of each OPT attention sub-layer, averaged over calibration samples.
+
+    This records `x` (before the projection) rather than `y` (after the
+    projection), making it suitable for calibrating W_o decomposition.
+
+    Args:
+        layer:   OPT decoder layer whose self_attn.out_proj is hooked.
+        fp_inps: Calibration inputs, shape (nsamples, seq_len, hidden_dim).
+        args:    Argument namespace; must contain
+                 args.eigen_attn_params['avg_dim_features'].
+
+    Returns:
+        avg_o: Tensor of shape (n_chunks, seq_len, out_proj_in_dim)
+               where n_chunks = nsamples // avg_dim_features.
+    """
+    avg_o = []
+    o = {}
+
+    avg_dim = args.eigen_attn_params['avg_dim_features']
+
+    def forward_hook_o_input(m, x, y, name):
+        # x is a tuple; index 0 is the actual input tensor
+        if isinstance(x, tuple):
+            x = x[0]
+
+        x_size = x.shape
+
+        if name in o.keys():
+            o[name] += [x.view(-1, x_size[-1])]
+        else:
+            o[name] = [x.view(-1, x_size[-1])]
+
+        dim = len(o[name])
+
+        if dim >= avg_dim:
+            X = torch.stack(o.pop(name)).mean(dim=0)
+            avg_o.append(X)
+
+    hooks = []
+    for n, m in layer.named_modules():
+        if isinstance(m, torch.nn.Linear) and '.out_proj' in n:
+            hooks.append(
+                m.register_forward_hook(
+                    partial(forward_hook_o_input, name=n)))
+
+    for j in range(args.nsamples):
+        layer(fp_inps[j].unsqueeze(0))
+
+    del o
+
+    for hook in hooks:
+        hook.remove()
+    torch.cuda.empty_cache()
+
+    avg_o = torch.stack(avg_o)
+
+    return avg_o
+
+
+@torch.no_grad()
+def get_out_proj_input_llama(layer, fp_inps, args, attention_mask, position_ids):
+    """
+    Capture the *input* activations fed into the o_proj (W_o) linear layer
+    of each LLaMA attention sub-layer, averaged over calibration samples.
+
+    Args:
+        layer:          LLaMA decoder layer whose self_attn.o_proj is hooked.
+        fp_inps:        Calibration inputs, shape (nsamples, seq_len, hidden_dim).
+        args:           Argument namespace; must contain
+                        args.eigen_attn_params['avg_dim_features'].
+        attention_mask: Attention mask passed to the layer forward call.
+        position_ids:   Position IDs passed to the layer forward call.
+
+    Returns:
+        avg_o: Tensor of shape (n_chunks, seq_len, o_proj_in_dim)
+               where n_chunks = nsamples // avg_dim_features.
+    """
+    avg_o = []
+    o = {}
+
+    avg_dim = args.eigen_attn_params['avg_dim_features']
+
+    def forward_hook_o_input(m, x, y, name):
+        if isinstance(x, tuple):
+            x = x[0]
+
+        x_size = x.shape
+
+        if name in o.keys():
+            o[name] += [x.view(-1, x_size[-1])]
+        else:
+            o[name] = [x.view(-1, x_size[-1])]
+
+        dim = len(o[name])
+
+        if dim >= avg_dim:
+            X = torch.stack(o.pop(name)).mean(dim=0)
+            avg_o.append(X)
+
+    hooks = []
+    for n, m in layer.named_modules():
+        # LLaMA uses 'o_proj'; exclude any 'up' variant to stay safe
+        if isinstance(m, torch.nn.Linear) and '.o_proj' in n and 'up' not in n:
+            hooks.append(
+                m.register_forward_hook(
+                    partial(forward_hook_o_input, name=n)))
+
+    for j in range(args.nsamples):
+        layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)
+
+    del o
+
+    for hook in hooks:
+        hook.remove()
+    torch.cuda.empty_cache()
+
+    avg_o = torch.stack(avg_o)
+
+    return avg_o
+
+
+@torch.no_grad()
 def get_attn_output_mpt(layer, fp_inps, args, position_bias, attention_mask):
     
     avg_o = []
@@ -653,6 +778,48 @@ def tensor_train_decompose_opt_layer_bias(layer, fp_inps, args, num_heads, layer
         )
 
     return results
+
+
+def tensor_train_decompose_opt_layer_out_proj(layer, fp_inps, args, num_heads, layer_id, ranks=None, num_factors=5):
+    """
+    Decompose the out_proj (W_o) weight matrix of an OPT attention layer
+    using Tensor-Train decomposition.
+
+    Args:
+        layer:       Transformer layer containing self_attn.out_proj.weight.
+        fp_inps:     Full-precision calibration inputs (unused, kept for API consistency).
+        args:        Argument namespace (unused, kept for API consistency).
+        num_heads:   Number of attention heads (unused, kept for API consistency).
+        layer_id:    Layer index (unused, kept for API consistency).
+        ranks:       TT-ranks.  None -> exact decomposition (uses max ranks).
+                     Must be a list of length (num_factors + 1) with first/last == 1.
+        num_factors: Number of TT-modes to split each weight dimension into.
+
+    Returns:
+        Dict with key \"O\" mapping to a sub-dict containing
+        \"factors\", \"metadata\", and \"compression_ratio\".
+    """
+    from decompose.tensor_train_utils import tensor_train_decompose
+
+    w_o = layer.self_attn.out_proj.weight.data
+    print(f"Original Shape - O (out_proj): {w_o.shape}")
+
+    factors, metadata = tensor_train_decompose(
+        w_o, num_factors=num_factors, ranks=ranks
+    )
+
+    original_size = w_o.numel()
+    compressed_size = sum(f.numel() for f in factors)
+    compression_ratio = compressed_size / original_size
+    print(f"  Compression ratio: {compression_ratio:.4f}  ({compression_ratio * 100:.2f} %)")
+
+    return {
+        "O": {
+            "factors": factors,
+            "metadata": metadata,
+            "compression_ratio": compression_ratio,
+        }
+    }
 
 
 def project_bias_with_tucker_factors(
