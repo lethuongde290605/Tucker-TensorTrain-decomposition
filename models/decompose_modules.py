@@ -929,19 +929,28 @@ class OPTTuckerTTAttention(nn.Module):
             self.k_proj.bias.data = b_k
             self.v_proj.bias.data = b_v
 
-        # ---- out_proj_up: compressed_dim → embed_dim ---------------------------
-        # w_o is the Tucker+TT compressed out_proj weight with shape (P, embed_dim)
-        # where P = prod(Tucker output ranks) is the compressed INPUT dim of out_proj.
-        # We use the Tucker-calibrated weight directly instead of the Kronecker
-        # approximation, so the projection is learned from real activations.
-        out_in_dim  = w_o.shape[0]   # P (compressed input dim of out_proj)
-        out_out_dim = w_o.shape[1]   # embed_dim (output stays uncompressed)
+        # ---- out_proj_up: Q_o → embed_dim ----------------------------------------
+        # w_o comes from reconstruct_combined_tt_cores → shape (M, Q)
+        #   M = prod(m_i) = embed_dim  (the OUTPUT dimension of the original out_proj)
+        #   Q = prod(q_i) = Q_o       (Tucker-compressed INPUT dimension)
+        #
+        # In the Tucker-TT model the attention output has shape (B, T, compressed_dim)
+        # where compressed_dim ≈ Q_o (same Tucker ratio applied to the same hidden_dim).
+        # So out_proj_up must be Linear(in=Q_o, out=embed_dim):
+        #   weight shape (out_features, in_features) = (embed_dim, Q_o) = w_o  ✓  (no transpose)
+        #
+        # The bias lives in the OUTPUT space = embed_dim, so we take the original
+        # out_proj bias directly; b_o (Tucker-projected, shape Q_o) is ignored here.
+        out_in_dim  = w_o.shape[1]   # Q_o  — compressed input dim
+        out_out_dim = w_o.shape[0]   # embed_dim — output dim (uncompressed)
         self.out_proj_up = nn.Linear(out_in_dim, out_out_dim, bias=bias)
-        # w_o shape: (P, embed_dim) — nn.Linear weight is (out_features, in_features)
-        self.out_proj_up.weight.data = w_o.t().contiguous()   # (embed_dim, P)
+        # w_o is already (embed_dim, Q_o) = (out_features, in_features) — assign directly
+        self.out_proj_up.weight.data = w_o.contiguous()
 
         if bias:
-            self.out_proj_up.bias.data = b_o
+            # Use the original out_proj bias (shape: embed_dim), not Tucker-projected b_o
+            self.out_proj_up.bias.data = org_module.out_proj.bias.data.clone()
+
 
     # ------------------------------------------------------------------
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
