@@ -953,3 +953,70 @@ def reconstruct_combined_tt_cores(new_cores: list) -> torch.Tensor:
     reconstructed = reconstructed.reshape(M, Q)
 
     return reconstructed
+
+
+def compute_kron_product(factors: list) -> torch.Tensor:
+    """Compute the Kronecker product of a list of factor matrices.
+
+    Args:
+        factors: List of k tensors, each of shape (n_i, q_i).
+
+    Returns:
+        Tensor of shape (prod(n_i), prod(q_i)) == (embed_dim, Q).
+    """
+    result = factors[0]
+    for f in factors[1:]:
+        result = torch.kron(result, f)
+    return result
+
+
+def compute_tucker_only_weights_qkv(
+    orig_proj: torch.nn.Linear,
+    factors: list,
+) -> tuple:
+    """Compute compressed weight and bias for a Q/K/V projection using Tucker factors.
+
+    Produces a new weight matrix for Linear(embed_dim → Q):
+        new_weight (Q, embed_dim) = kron(factors).T @ orig_weight
+
+    Args:
+        orig_proj: Original nn.Linear with weight (embed_dim, embed_dim).
+        factors:   Tucker factors [U_1, ..., U_k], each (n_i, q_i).
+
+    Returns:
+        (new_weight, new_bias) where new_weight has shape (Q, embed_dim).
+    """
+    kron_W = compute_kron_product(factors)          # (embed_dim, Q)
+    new_w = kron_W.t() @ orig_proj.weight           # (Q, embed_dim) @ (embed_dim, embed_dim) → (Q, embed_dim)
+    new_b = (
+        project_bias_with_tucker_factors(orig_proj.bias.data, factors)
+        if orig_proj.bias is not None
+        else None
+    )
+    return new_w, new_b
+
+
+def compute_tucker_only_weights_o(
+    orig_out_proj: torch.nn.Linear,
+    factors: list,
+) -> tuple:
+    """Compute compressed weight and bias for the O projection using Tucker factors.
+
+    Produces a new weight matrix for Linear(Q_o → embed_dim):
+        new_weight (embed_dim, Q_o) = orig_weight @ kron(factors)
+
+    Args:
+        orig_out_proj: Original nn.Linear with weight (embed_dim, embed_dim).
+        factors:       Tucker factors [U_1, ..., U_k], each (n_i, q_i).
+
+    Returns:
+        (new_weight, new_bias) where new_weight has shape (embed_dim, Q_o).
+    """
+    kron_W = compute_kron_product(factors)           # (embed_dim, Q_o)
+    new_w = orig_out_proj.weight @ kron_W            # (embed_dim, embed_dim) @ (embed_dim, Q_o) → (embed_dim, Q_o)
+    new_b = (
+        orig_out_proj.bias.data.clone()
+        if orig_out_proj.bias is not None
+        else None
+    )
+    return new_w, new_b

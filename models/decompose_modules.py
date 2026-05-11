@@ -1172,3 +1172,297 @@ class OPTTuckerTTDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
         return outputs
+
+
+class OPTTuckerAttention(nn.Module):
+    """
+    OPT self-attention with Tucker-only compressed Q/K/V projections.
+
+    Weight shapes after Tucker-only compression:
+      w_q / w_k / w_v : (Q, embed_dim)  where Q = prod(Tucker ranks) < embed_dim
+      b_q / b_k / b_v : (Q,)            Tucker-projected bias
+      w_o             : (embed_dim, Q_o) out_proj compressed via Kronecker product
+      b_o             : (embed_dim,)     original out_proj bias (unchanged)
+
+    Each QKV projection maps embed_dim → Q, so K/V cache stores (seq_len, Q//H)
+    per head instead of (seq_len, head_dim).
+    """
+
+    def __init__(
+        self,
+        org_module: nn.Module,
+        w_q: torch.Tensor,            # shape (Q, embed_dim)
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        w_o: torch.Tensor,            # shape (embed_dim, Q_o)
+        b_q: torch.Tensor,
+        b_k: torch.Tensor,
+        b_v: torch.Tensor,
+        b_o: torch.Tensor,            # shape (embed_dim,) — original out_proj bias
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        is_decoder: bool = False,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.embed_dim  = embed_dim
+        self.num_heads  = num_heads
+        self.dropout    = dropout
+
+        assert w_q.shape == w_k.shape == w_v.shape, (
+            f"w_q, w_k, w_v must have the same shape, "
+            f"got {w_q.shape}, {w_k.shape}, {w_v.shape}"
+        )
+        self.compressed_dim = w_q.shape[0]   # Q = prod(Tucker ranks)
+        assert self.compressed_dim % num_heads == 0, (
+            f"compressed_dim (Q={self.compressed_dim}) must be divisible by "
+            f"num_heads={num_heads}."
+        )
+        self.head_dim   = self.compressed_dim // num_heads
+        self.scaling    = self.head_dim ** -0.5
+        self.is_decoder = is_decoder
+
+        self.q_proj = nn.Linear(embed_dim, self.compressed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, self.compressed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, self.compressed_dim, bias=bias)
+
+        # w_q/w_k/w_v already have shape (Q, embed_dim) = (out, in) — assign directly
+        self.q_proj.weight.data = w_q.contiguous()
+        self.k_proj.weight.data = w_k.contiguous()
+        self.v_proj.weight.data = w_v.contiguous()
+
+        if bias:
+            self.q_proj.bias.data = b_q
+            self.k_proj.bias.data = b_k
+            self.v_proj.bias.data = b_v
+
+        # out_proj_up: Linear(Q_o, embed_dim)
+        # w_o shape: (embed_dim, Q_o) = (out_features, in_features)
+        out_in_dim  = w_o.shape[1]   # Q_o
+        out_out_dim = w_o.shape[0]   # embed_dim
+        self.out_proj_up = nn.Linear(out_in_dim, out_out_dim, bias=bias)
+        self.out_proj_up.weight.data = w_o.contiguous()
+
+        if bias:
+            if b_o is not None:
+                self.out_proj_up.bias.data = b_o
+            else:
+                self.out_proj_up.bias.data = org_module.out_proj.bias.data.clone()
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return (
+            tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Input shape: Batch × Time × Channel"""
+        is_cross_attention = key_value_states is not None
+        bsz, tgt_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states) * self.scaling
+
+        if is_cross_attention and past_key_value is not None:
+            key_states   = past_key_value[0]
+            value_states = past_key_value[1]
+        elif is_cross_attention:
+            key_states   = self._shape(self.k_proj(key_value_states), -1, bsz)
+            value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
+        elif past_key_value is not None:
+            key_states   = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+            key_states   = torch.cat([past_key_value[0], key_states],   dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        else:
+            key_states   = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+
+        if self.is_decoder:
+            past_key_value = (key_states, value_states)
+
+        proj_shape   = (bsz * self.num_heads, -1, self.head_dim)
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
+        key_states   = key_states.view(*proj_shape)
+        value_states = value_states.view(*proj_shape)
+
+        src_len      = key_states.size(1)
+        attn_weights = torch.matmul(query_states, key_states.transpose(1, 2))
+
+        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
+            raise ValueError(
+                f"Attention weights should be of size "
+                f"{(bsz * self.num_heads, tgt_len, src_len)}, "
+                f"but is {attn_weights.size()}"
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size "
+                    f"{(bsz, 1, tgt_len, src_len)}, "
+                    f"but is {attention_mask.size()}"
+                )
+            attn_weights = (
+                attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                + attention_mask
+            )
+            attn_weights = torch.max(
+                attn_weights,
+                torch.tensor(torch.finfo(attn_weights.dtype).min),
+            )
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+        if attn_weights.dtype == torch.float16:
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(torch.float16)
+        else:
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        if layer_head_mask is not None:
+            if layer_head_mask.size() != (self.num_heads,):
+                raise ValueError(
+                    f"Head mask for a single layer should be of size "
+                    f"{(self.num_heads,)}, but is {layer_head_mask.size()}"
+                )
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+        attn_weights_reshaped = (
+            attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            if output_attentions else None
+        )
+
+        attn_output = torch.matmul(attn_weights, value_states)   # (B*H, T, head_dim)
+        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+        attn_output = attn_output.transpose(1, 2)                 # (B, T, H, head_dim)
+        attn_output = attn_output.reshape(bsz, tgt_len, self.compressed_dim)
+        attn_output = self.out_proj_up(attn_output)               # (B, T, embed_dim)
+
+        return attn_output, attn_weights_reshaped, past_key_value
+
+
+class OPTTuckerDecoderLayer(nn.Module):
+    """
+    OPT decoder layer with Tucker-only compressed Q/K/V/O weights.
+
+    Args:
+        ori_layer:        Original OPTDecoderLayer.
+        config:           OPT model config.
+        w_q/w_k/w_v:      Tucker-only weight tensors, shape (Q, embed_dim).
+        w_o:              Tucker-only weight for out_proj, shape (embed_dim, Q_o).
+        b_q/b_k/b_v:      Tucker-projected biases, shape (Q,).
+        b_o:              Original out_proj bias, shape (embed_dim,).
+        tucker_factors_v: Tucker V-factors kept for API compatibility (unused in forward).
+    """
+
+    def __init__(
+        self,
+        ori_layer,
+        config,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        w_o: torch.Tensor,
+        b_q: torch.Tensor,
+        b_k: torch.Tensor,
+        b_v: torch.Tensor,
+        b_o: torch.Tensor,
+        tucker_factors_v: list,
+    ):
+        super().__init__()
+        self.embed_dim = config.hidden_size
+
+        self.self_attn = OPTTuckerAttention(
+            org_module  = ori_layer.self_attn,
+            w_q         = w_q,
+            w_k         = w_k,
+            w_v         = w_v,
+            w_o         = w_o,
+            b_q         = b_q,
+            b_k         = b_k,
+            b_v         = b_v,
+            b_o         = b_o,
+            embed_dim   = self.embed_dim,
+            num_heads   = config.num_attention_heads,
+            dropout     = config.attention_dropout,
+            is_decoder  = True,
+            bias        = config.enable_bias,
+        )
+
+        self.do_layer_norm_before = config.do_layer_norm_before
+        self.dropout              = config.dropout
+        self.self_attn_layer_norm = ori_layer.self_attn_layer_norm
+
+        self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
+        self.fc1.weight.data = ori_layer.fc1.weight.data.clone()
+        self.fc1.bias.data   = ori_layer.fc1.bias.data.clone()
+
+        self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
+        self.fc2.weight.data = ori_layer.fc2.weight.data.clone()
+        self.fc2.bias.data   = ori_layer.fc2.bias.data.clone()
+
+        self.final_layer_norm = ori_layer.final_layer_norm
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        **kwargs,
+    ):
+        residual = hidden_states
+
+        if self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states     = hidden_states,
+            past_key_value    = past_key_value,
+            attention_mask    = attention_mask,
+            layer_head_mask   = layer_head_mask,
+            output_attentions = output_attentions,
+        )
+        hidden_states = nn.functional.dropout(hidden_states, p=0.0, training=False)
+        hidden_states = residual + hidden_states
+
+        if not self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        hidden_states_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+        residual = hidden_states
+
+        if self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = F.relu(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+
+        hidden_states = (residual + hidden_states).view(hidden_states_shape)
+
+        if not self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
+        return outputs

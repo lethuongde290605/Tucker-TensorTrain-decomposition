@@ -4,14 +4,11 @@ import copy
 import gc
 
 from decompose.eigen_attn_utils import (decompose_opt_layer, decompose_mpt_layer, decompose_llama_layer,
-                                         tensor_train_decompose_opt_layer,
-                                         tensor_train_decompose_opt_layer_out_proj,
-                                         apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores,
-                                         project_bias_with_tucker_factors,
-                                        tensor_train_decompose_opt_layer_bias)
+                                         compute_tucker_only_weights_qkv,
+                                         compute_tucker_only_weights_o)
 from decompose.tucker_utils import tucker_decompose_opt_layer
 from models.decompose_modules import (OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer,
-                                      OPTTuckerTTDecoderLayer)
+                                      OPTTuckerDecoderLayer)
 
 
 def eigenattn(
@@ -143,41 +140,27 @@ def eigenattn(
         if is_opt:
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
-                    args.eigen_attn_params['threshold'] = 0.98
-                    error = 0.0
                     num_heads = lm.model.config.num_attention_heads
-                    # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
-                    tucker       = tucker_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
-                    tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
-                    tensor_train_o = tensor_train_decompose_opt_layer_out_proj(layer, inps, args, num_heads, i, num_factors=5)
-                    # Merge O result into the tensor_train dict so the loop below handles all four projections
-                    tensor_train["O"] = tensor_train_o["O"]
-                    # ---- build compressed Q / K / V weight matrices --------
-                    # tucker["Q/K/V"]["factors"]       : list of k Tucker factor matrices (n_i, q_i)
-                    # tensor_train["Q/K/V"]["factors"] : list of k TT-matrix cores (r_i, m_i, n_i, r_{i+1})
+
+                    tucker = tucker_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
+
                     new_weights = {}
                     new_bias    = {}
 
-                    for proj in ("Q", "K", "V", "O"):
-                        tucker_factors = tucker[proj]["factors"]
-                        tt_cores       = tensor_train[proj]["factors"]
+                    proj_attr_map = {"Q": "q_proj", "K": "k_proj", "V": "v_proj"}
+                    for proj, attr in proj_attr_map.items():
+                        orig_proj = getattr(layer.self_attn, attr)
+                        w, b = compute_tucker_only_weights_qkv(orig_proj, tucker[proj]["factors"])
+                        new_weights[proj] = w
+                        new_bias[proj]    = b
+                        logger.info(f"Layer {i} {proj} compressed weight: {w.shape}, bias: {b.shape if b is not None else None}")
 
-                        combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores)
-                        new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
+                    w_o, b_o = compute_tucker_only_weights_o(layer.self_attn.out_proj, tucker["O"]["factors"])
+                    new_weights["O"] = w_o
+                    new_bias["O"]    = b_o
+                    logger.info(f"Layer {i} O compressed weight: {w_o.shape}, bias: {b_o.shape if b_o is not None else None}")
 
-                        # For Q/K/V the bias comes from the Q/K/V projections;
-                        # for O the bias comes from out_proj.
-                        proj_name_map = {
-                            "Q": "q_proj", "K": "k_proj",
-                            "V": "v_proj", "O": "out_proj",
-                        }
-                        orig_bias = getattr(layer.self_attn, proj_name_map[proj]).bias.data
-                        new_bias[proj] = project_bias_with_tucker_factors(orig_bias, tucker_factors)
-
-                        logger.info(f"New weight {proj} shape: {new_weights[proj].shape}")
-                        logger.info(f"New bias {proj} shape: {new_bias[proj].shape}")
-
-                    qlayer = OPTTuckerTTDecoderLayer(
+                    qlayer = OPTTuckerDecoderLayer(
                         ori_layer        = layer,
                         config           = lm.model.config,
                         w_q              = new_weights["Q"],
@@ -190,35 +173,6 @@ def eigenattn(
                         b_o              = new_bias["O"],
                         tucker_factors_v = tucker["V"]["factors"],
                     ).to(dev)
-                    '''
-                    return tensor_train
-
-                    rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
-                    rank_v = num_heads * torch.amax((torch.cumsum(eval_v, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
-
-                    output_hr = torch.stack([layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0] for j in range(args.nsamples)])
-                    while error < args.error_budget and args.eigen_attn_params['threshold']> 0.3 and rank_kq > 64 and rank_v > 64:
-                        output_lr = torch.stack([qlayer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0] for j in range(args.nsamples)])
-                        error = (torch.norm(output_hr - output_lr)/torch.norm(output_hr))
-                        args.eigen_attn_params['threshold'] -= 0.02
-                        rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
-                        rank_v = num_heads * torch.amax((torch.cumsum(eval_v, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
-
-
-                    #error budget has been reached, revert back to the previous SVD threshold
-                    args.eigen_attn_params['threshold'] += 0.04
-                    rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
-                    rank_v = num_heads * torch.amax((torch.cumsum(eval_v, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
-                    
-                    qlayer = DecoderLayer(layer, args, basis_kq, rank_kq, basis_v, rank_v, lm.model.config).to(dev)
-
-                    output_lr = torch.stack([qlayer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0] for j in range(args.nsamples)])
-                    error = (torch.norm(output_hr - output_lr)/torch.norm(output_hr))
-
-                    # del output_hr, output_lr, basis_kq, basis_v
-                    del basis_kq, basis_v
-                    torch.cuda.empty_cache()
-                    '''
 
                     # obtain output of model for propagation to next layer
                     with torch.no_grad():
