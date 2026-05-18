@@ -79,10 +79,12 @@ def generate_text(model, tokenizer, prompt: str, device, max_new_tokens: int = 4
             use_cache=True,
             return_dict_in_generate=True,
             output_scores=True,
+            output_attentions=True,   # Added to get attention weights
         )
     
     output_ids = outputs.sequences
     scores = outputs.scores
+    attentions = outputs.attentions
     
     # Decode only the generated (new) tokens
     generated = output_ids[0, inputs["input_ids"].shape[1]:]
@@ -100,7 +102,21 @@ def generate_text(model, tokenizer, prompt: str, device, max_new_tokens: int = 4
                 print(f"      Top {i + 1}: '{token_str}' (id: {top_indices[i].item():>5}) - prob: {top_probs[i].item():.4f}")
             chosen_token = generated[step]
             chosen_str = tokenizer.decode(chosen_token).replace('\n', '\\n')
-            print(f"      -> Chosen: '{chosen_str}' (id: {chosen_token.item()})\n")
+            print(f"      -> Chosen: '{chosen_str}' (id: {chosen_token.item()})")
+            
+            if attentions is not None:
+                # attentions[step] has tuples for each layer. Let's inspect the last layer.
+                # Shape of last_layer_attn: (batch=1, num_heads, q_len=1, k_len)
+                last_layer_attn = attentions[step][-1]
+                avg_attn = last_layer_attn[0].mean(dim=0).squeeze(-2) # Average across heads (shape: k_len)
+                
+                # Get the top 3 tokens this step paid attention to
+                k_len = avg_attn.shape[-1]
+                top_k = min(3, k_len)
+                top_attn_vals, top_attn_idx = torch.topk(avg_attn, top_k)
+                
+                print(f"      -> Last layer avg attention top {top_k} indices: {top_attn_idx.tolist()} (weights: {[f'{v:.4f}' for v in top_attn_vals.tolist()]})")
+            print()
     
     return tokenizer.decode(generated, skip_special_tokens=True)
 
