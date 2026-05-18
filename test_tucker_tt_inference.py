@@ -115,7 +115,9 @@ def generate_text(model, tokenizer, prompt: str, device, max_new_tokens: int = 4
                 top_k = min(3, k_len)
                 top_attn_vals, top_attn_idx = torch.topk(avg_attn, top_k)
                 
-                print(f"      -> Last layer avg attention top {top_k} indices: {top_attn_idx.tolist()} (weights: {[f'{v:.4f}' for v in top_attn_vals.tolist()]})")
+                weights_str = ", ".join([f"{v:.4f}" for v in top_attn_vals.tolist()])
+                indices_str = str(top_attn_idx.tolist())
+                print(f"      -> Last layer avg attention top {top_k} indices: {indices_str} (weights: [{weights_str}])")
             print()
     
     return tokenizer.decode(generated, skip_special_tokens=True)
