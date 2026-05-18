@@ -97,9 +97,7 @@ def apply_tucker_tt_attention_patch():
         if not hasattr(self, 'debug_cache'):
             self.debug_cache = {}
 
-        is_cross_attention = key_value_states is not None
         bsz, tgt_len, _ = hidden_states.size()
-
         query_states = self.q_proj(hidden_states) * self.scaling
 
         if is_cross_attention and past_key_value is not None:
