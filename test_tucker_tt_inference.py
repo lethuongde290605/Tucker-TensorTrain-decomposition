@@ -19,6 +19,26 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from models.decompose_modules import OPTTuckerTTAttention
+import torch.nn.functional as F
+
+def tensor_stats(x):
+    if x is None: return {}
+    return {
+        "mean": float(x.mean().item()),
+        "std": float(x.std().item()),
+        "min": float(x.min().item()),
+        "max": float(x.max().item()),
+        "norm": float(x.norm().item())
+    }
+
+def cosine_sim(a, b):
+    if a is None or b is None: return 0.0
+    return float(F.cosine_similarity(a.view(-1), b.view(-1), dim=0).item())
+
+def kl_div(p, q):
+    if p is None or q is None: return 0.0
+    # p, q are log_softmax outputs
+    return float(F.kl_div(p, q, reduction='batchmean', log_target=True).item())
 
 def count_params(model) -> int:
     return sum(p.numel() for p in model.parameters())
@@ -110,14 +130,14 @@ def apply_tucker_tt_attention_patch():
         attn_weights = torch.matmul(query_states, key_states.transpose(1, 2))
 
         # --- DEBUG CACHE ---
-        self.debug_cache["Q_mean"] = float(query_states.mean().item())
-        self.debug_cache["Q_std"] = float(query_states.std().item())
+        self.debug_cache["Q_norm"] = float(query_states[:, -1, :].norm().item())
+        self.debug_cache["K_norm"] = float(key_states.norm().item())
+        self.debug_cache["V_norm"] = float(value_states.norm().item())
+        self.debug_cache["Q_mean"] = float(query_states[:, -1, :].mean().item())
         self.debug_cache["K_mean"] = float(key_states.mean().item())
-        self.debug_cache["K_std"] = float(key_states.std().item())
         self.debug_cache["V_mean"] = float(value_states.mean().item())
-        self.debug_cache["V_std"] = float(value_states.std().item())
-        self.debug_cache["pre_softmax_attn_weights_mean"] = float(attn_weights.mean().item())
-        self.debug_cache["pre_softmax_attn_weights_max"] = float(attn_weights.max().item())
+        self.debug_cache["pre_softmax_attn_weights_mean"] = float(attn_weights[:, -1, :].mean().item())
+        self.debug_cache["pre_softmax_attn_weights_max"] = float(attn_weights[:, -1, :].max().item())
 
         if attention_mask is not None:
             attn_weights = (attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask)
@@ -143,8 +163,13 @@ def apply_tucker_tt_attention_patch():
         attn_output = self.out_proj_up(attn_output)
 
         # --- DEBUG CACHE ---
-        self.debug_cache["attn_output_mean"] = float(attn_output.mean().item())
-        self.debug_cache["attn_output_std"] = float(attn_output.std().item())
+        self.debug_cache["attn_output_norm"] = float(attn_output[:, -1, :].norm().item())
+        self.debug_cache["attn_output_std"] = float(attn_output[:, -1, :].std().item())
+        
+        # Entropy of attention per head for last query token
+        recent_probs = attn_probs.view(bsz, self.num_heads, tgt_len, src_len)[:, :, -1, :]
+        ent = -(recent_probs * torch.log(recent_probs + 1e-12)).sum(dim=-1).mean().item()
+        self.debug_cache["attn_entropy"] = ent
 
         return attn_output, attn_weights_reshaped, past_key_value
 
@@ -192,36 +217,139 @@ def generate_text_debug_deep(
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_ids = inputs.input_ids
-    base_input_ids = input_ids.clone() if compare_baseline else None
 
     trace_data = []
-    past_key_values = None
-    baseline_past = None
+    
+    prev_logits = None
+    prev_final_hidden = None
+    prev_layer_hiddens = None
 
     import json
+    
+    watched_tokens = {
+        "comma": 6,
+        "period": 4,
+        "and": 8,
+        "dash": 12,
+        "newline": 50118,
+        "eos": tokenizer.eos_token_id
+    }
+
     for step in range(max_new_tokens):
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, use_cache=True, past_key_values=past_key_values, output_attentions=True)
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-            past_key_values = outputs.past_key_values
-
-            base_token = None
+            outputs = model(
+                input_ids=input_ids, 
+                use_cache=False, 
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            
+            logits = outputs.logits[:, -1, :] # shape: (1, vocab_size)
+            probs = torch.softmax(logits, dim=-1)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            
+            next_token = torch.argmax(logits, dim=-1).unsqueeze(-1)
+            
+            top_probs, top_indices = torch.topk(probs, 5)
+            top_logits, _ = torch.topk(logits, 5)
+            
+            # --- Extract Hidden States ---
+            final_hidden = outputs.hidden_states[-1][:, -1, :]
+            hidden_stats = tensor_stats(final_hidden)
+            layer_hiddens = [h[:, -1, :] for h in outputs.hidden_states]
+            
+            # --- Calculate Logit Stats ---
+            logits_stats = tensor_stats(logits)
+            logits_stats["entropy"] = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).item()
+            logits_stats["margin_top1_top2"] = (top_logits[0, 0] - top_logits[0, 1]).item()
+            
+            # --- Watched Tokens ---
+            watched_stats = {}
+            for name, tid in watched_tokens.items():
+                if tid is not None:
+                    watched_stats[name] = {
+                        "logit": float(logits[0, tid].item()),
+                        "prob": float(probs[0, tid].item())
+                    }
+                    
+            # --- Diff with Previous Step ---
+            logits_vs_prev = {}
+            hidden_vs_prev = {}
+            layer_hiddens_vs_prev = []
+            
+            if prev_logits is not None:
+                logits_vs_prev["cosine_sim"] = cosine_sim(logits, prev_logits)
+                logits_vs_prev["kl_div"] = kl_div(log_probs, torch.log_softmax(prev_logits, dim=-1))
+                
+                hidden_vs_prev["cosine_sim"] = cosine_sim(final_hidden, prev_final_hidden)
+                hidden_vs_prev["max_abs_diff"] = float(torch.max(torch.abs(final_hidden - prev_final_hidden)).item())
+                
+                for i, (lh, ph) in enumerate(zip(layer_hiddens, prev_layer_hiddens)):
+                    h_sim = cosine_sim(lh, ph)
+                    layer_hiddens_vs_prev.append({
+                        "layer": i,
+                        "norm": float(lh.norm().item()),
+                        "cosine_sim_prev": h_sim
+                    })
+                    if h_sim > 0.999 or h_sim < 0.1:
+                        print(f"    [WARNING] Layer {i} hidden sim abnormal: {h_sim:.4f}")
+                        
+                if logits_vs_prev["cosine_sim"] > 0.999:
+                    print("    [WARNING] logits distribution collapsed / nearly identical across steps")
+                
+                if hidden_vs_prev["cosine_sim"] > 0.999:
+                    print("    [WARNING] final hidden state is almost unchanged across steps")
+                    
+            # --- Baseline Teacher Forcing ---
+            baseline_compare = {}
             if compare_baseline and baseline_model:
-                base_outputs = baseline_model(input_ids=base_input_ids, use_cache=True, past_key_values=baseline_past)
+                base_outputs = baseline_model(
+                    input_ids=input_ids, 
+                    use_cache=False, 
+                    output_hidden_states=True,
+                    return_dict=True
+                )
                 base_logits = base_outputs.logits[:, -1, :]
-                base_token = torch.argmax(base_logits, dim=-1).unsqueeze(-1)
-                baseline_past = base_outputs.past_key_values
-                base_input_ids = torch.cat([base_input_ids, base_token], dim=-1)
+                base_probs = torch.softmax(base_logits, dim=-1)
+                base_log_probs = torch.log_softmax(base_logits, dim=-1)
+                base_final_hidden = base_outputs.hidden_states[-1][:, -1, :]
+                
+                base_top_p, base_top_idx = torch.topk(base_probs, 5)
+                
+                baseline_compare = {
+                    "logits_cosine_sim": cosine_sim(logits, base_logits),
+                    "kl_div": kl_div(log_probs, base_log_probs),
+                    "final_hidden_cosine_sim": cosine_sim(final_hidden, base_final_hidden),
+                    "comma_logit_diff": float((logits[0, 6] - base_logits[0, 6]).item()),
+                    "comma_prob_compressed": float(probs[0, 6].item()),
+                    "comma_prob_baseline": float(base_probs[0, 6].item()),
+                    "top_probs_baseline": [float(p) for p in base_top_p[0]],
+                    "top_indices_baseline": [int(idx) for idx in base_top_idx[0]]
+                }
 
+            # Update prev tracking
+            prev_logits = logits.clone()
+            prev_final_hidden = final_hidden.clone()
+            prev_layer_hiddens = [h.clone() for h in layer_hiddens]
+            
             input_ids = torch.cat([input_ids, next_token], dim=-1)
 
             step_trace = {
                 "step": step,
-                "token_id": next_token.item(),
-                "token_str": tokenizer.decode(next_token[0]),
-                "baseline_token": tokenizer.decode(base_token[0]) if base_token is not None else None,
-                "layer_stats": {}
+                "context_tokens": [tokenizer.decode(t) for t in input_ids[0, :-1]],
+                "chosen_token": tokenizer.decode(next_token[0]),
+                "top_k_indices": [int(idx) for idx in top_indices[0]],
+                "top_k_probs": [float(p) for p in top_probs[0]],
+                "top_k_logits": [float(l) for l in top_logits[0]],
+                "logits_stats": logits_stats,
+                "watched_token_stats": watched_stats,
+                "hidden_stats": hidden_stats,
+                "logits_vs_prev": logits_vs_prev,
+                "hidden_vs_prev": hidden_vs_prev,
+                "layer_hidden_stats": layer_hiddens_vs_prev,
+                "layer_stats": {},
+                "baseline_compare": baseline_compare
             }
 
             for name, module in model.named_modules():
@@ -230,8 +358,8 @@ def generate_text_debug_deep(
                     module.debug_cache.clear()
 
             trace_data.append(step_trace)
-            base_info = f" | Base -> {step_trace['baseline_token']!r}" if base_token else ""
-            print(f"Step {step}: Model -> {step_trace['token_str']!r}{base_info}")
+            base_info = f" | KL_base: {baseline_compare.get('kl_div', 0):.4f}" if baseline_compare else ""
+            print(f"Step {step}: Model -> {step_trace['chosen_token']!r}{base_info}")
 
     if save_path:
         with open(save_path, 'w') as f:
