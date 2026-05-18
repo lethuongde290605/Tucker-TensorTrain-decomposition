@@ -106,9 +106,10 @@ def generate_text(model, tokenizer, prompt: str, device, max_new_tokens: int = 4
             
             if attentions is not None:
                 # attentions[step] has tuples for each layer. Let's inspect the last layer.
-                # Shape of last_layer_attn: (batch=1, num_heads, q_len=1, k_len)
+                # Shape of last_layer_attn: (batch=1, num_heads, q_len, k_len)
                 last_layer_attn = attentions[step][-1]
-                avg_attn = last_layer_attn[0].mean(dim=0).squeeze(-2) # Average across heads (shape: k_len)
+                avg_attn = last_layer_attn[0].mean(dim=0) # Average across heads (shape: q_len, k_len)
+                avg_attn = avg_attn[-1] # Take attention of the last query token (shape: k_len,)
                 
                 # Get the top 3 tokens this step paid attention to
                 k_len = avg_attn.shape[-1]
