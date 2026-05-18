@@ -67,19 +67,41 @@ def layer_shape_report(model):
     return report
 
 
-def generate_text(model, tokenizer, prompt: str, device, max_new_tokens: int = 40) -> str:
+def generate_text(model, tokenizer, prompt: str, device, max_new_tokens: int = 40, debug: bool = False) -> str:
     model.eval()
     # Always send inputs to wherever the model actually lives
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
-        output_ids = model.generate(
+        outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,          # greedy — deterministic & fast
             use_cache=True,
+            return_dict_in_generate=True,
+            output_scores=True,
         )
+    
+    output_ids = outputs.sequences
+    scores = outputs.scores
+    
     # Decode only the generated (new) tokens
     generated = output_ids[0, inputs["input_ids"].shape[1]:]
+    
+    if debug:
+        print("\n  [DEBUG] Next-token prediction probabilities:")
+        for step, score in enumerate(scores):
+            probs = torch.softmax(score[0], dim=-1)
+            top_probs, top_indices = torch.topk(probs, 5)
+            print(f"    Step {step + 1}:")
+            for i in range(5):
+                token_str = tokenizer.decode(top_indices[i])
+                # replace newlines to make it print nicely
+                token_str = token_str.replace('\n', '\\n')
+                print(f"      Top {i + 1}: '{token_str}' (id: {top_indices[i].item():>5}) - prob: {top_probs[i].item():.4f}")
+            chosen_token = generated[step]
+            chosen_str = tokenizer.decode(chosen_token).replace('\n', '\\n')
+            print(f"      -> Chosen: '{chosen_str}' (id: {chosen_token.item()})\n")
+    
     return tokenizer.decode(generated, skip_special_tokens=True)
 
 
@@ -267,7 +289,7 @@ def main():
     compressed_model = compressed_model.to(infer_device)
     t0 = time.time()
     compressed_text = generate_text(
-        compressed_model, tokenizer, args.prompt, infer_device, args.max_new_tokens
+        compressed_model, tokenizer, args.prompt, infer_device, args.max_new_tokens, debug=True
     )
     print(f"  Compressed output: {compressed_text!r}")
     print(f"  Time             : {time.time() - t0:.2f}s")
