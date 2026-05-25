@@ -124,6 +124,16 @@ def apply_tucker_tt_attention_patch():
             self.debug_cache["Q_recon_norm"] = float(Q_recon.norm().item())
             self.debug_cache["Q_compressed_norm"] = float(query_states_unscaled.norm().item())
 
+            if hasattr(self, 'orig_q_proj') and self.orig_q_proj is not None:
+                orig_q_proj_dev = self.orig_q_proj.to(hidden_states.device)
+                Q_orig_unscaled = orig_q_proj_dev(hidden_states)
+                diff_norm = float(torch.norm(Q_recon - Q_orig_unscaled).item())
+                orig_norm = float(torch.norm(Q_orig_unscaled).item())
+                rel_err = diff_norm / orig_norm if orig_norm > 0 else 0.0
+                
+                self.debug_cache["Q_orig_norm"] = orig_norm
+                self.debug_cache["Q_recon_rel_err"] = rel_err
+
         if is_cross_attention and past_key_value is not None:
             key_states = past_key_value[0]
             value_states = past_key_value[1]
@@ -381,7 +391,23 @@ def generate_text_debug_deep(
 
             trace_data.append(step_trace)
             base_info = f" | KL_base: {baseline_compare.get('kl_div', 0):.4f}" if baseline_compare else ""
+            
+            avg_q_err = 0.0
+            err_counts = 0
+            layer_err_strs = []
+            for name, stats in step_trace["layer_stats"].items():
+                if "Q_recon_rel_err" in stats:
+                    err = stats["Q_recon_rel_err"]
+                    avg_q_err += err
+                    err_counts += 1
+                    layer_err_strs.append(f"{err:.4f}")
+
+            if err_counts > 0:
+                base_info += f" | Avg_Q_err: {avg_q_err/err_counts:.4f}"
+
             print(f"Step {step}: Model -> {step_trace['chosen_token']!r}{base_info}")
+            if err_counts > 0:
+                print(f"    -> Per-layer Q reconstruct error: [{', '.join(layer_err_strs)}]")
 
     if save_path:
         with open(save_path, 'w') as f:
@@ -504,6 +530,13 @@ def main():
                 args.model, config=config, device_map="cpu", torch_dtype=torch.float16, cache_dir=args.cache_dir
             ).to(infer_device)
             baseline_model_compare.eval()
+            
+            # Inject uncompressed Q weights for exact original Q recon error calculation
+            for i, layer in enumerate(compressed_model.model.decoder.layers):
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'orig_q_proj'):
+                    pass # already set
+                elif hasattr(layer, 'self_attn'):
+                    layer.self_attn.orig_q_proj = baseline_model_compare.model.decoder.layers[i].self_attn.q_proj
 
         print(f"\n[4/4] Deep Debug Generation (manual greedy loop) ...")
         compressed_text = generate_text_debug_deep(
