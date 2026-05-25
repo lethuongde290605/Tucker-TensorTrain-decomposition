@@ -884,10 +884,11 @@ class OPTTuckerTTAttention(nn.Module):
         b_k: torch.Tensor,
         b_v: torch.Tensor,
         b_o: torch.Tensor,            # Tucker-projected bias for out_proj, shape (P,)
+        tucker_factors_v: list,       # Tucker factors for V: [U_i (n_i, q_i)]
         tucker_factors_q: list = None,
         tucker_factors_k: list = None,
-        tucker_factors_v: list = None,
-        embed_dim: int = 768,
+        tucker_factors_o: list = None,
+        embed_dim: int = None,
         num_heads: int = 12,
         dropout: float = 0.0,
         is_decoder: bool = False,
@@ -897,9 +898,6 @@ class OPTTuckerTTAttention(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout   = dropout
-        self.tucker_factors_q = tucker_factors_q
-        self.tucker_factors_k = tucker_factors_k
-        self.tucker_factors_v = tucker_factors_v
 
         assert w_q.shape == w_k.shape == w_v.shape, (
             f"w_q, w_k, w_v must have the same shape, "
@@ -917,6 +915,22 @@ class OPTTuckerTTAttention(nn.Module):
         self.head_dim       = self.compressed_dim // num_heads
         self.scaling        = self.head_dim ** -0.5
         self.is_decoder     = is_decoder
+
+        # --- Reconstruct error tracking ---
+        self.tucker_factors_q = tucker_factors_q
+        self.tucker_factors_k = tucker_factors_k
+        self.tucker_factors_v = tucker_factors_v
+        self.tucker_factors_o = tucker_factors_o
+        
+        self.ori_w_q = org_module.q_proj.weight.data.clone() if hasattr(org_module, 'q_proj') else None
+        self.ori_b_q = org_module.q_proj.bias.data.clone() if hasattr(org_module, 'q_proj') and org_module.q_proj.bias is not None else None
+        self.ori_w_k = org_module.k_proj.weight.data.clone() if hasattr(org_module, 'k_proj') else None
+        self.ori_b_k = org_module.k_proj.bias.data.clone() if hasattr(org_module, 'k_proj') and org_module.k_proj.bias is not None else None
+        self.ori_w_v = org_module.v_proj.weight.data.clone() if hasattr(org_module, 'v_proj') else None
+        self.ori_b_v = org_module.v_proj.bias.data.clone() if hasattr(org_module, 'v_proj') and org_module.v_proj.bias is not None else None
+        self.ori_w_o = org_module.out_proj.weight.data.clone() if hasattr(org_module, 'out_proj') else None
+        self.ori_b_o = org_module.out_proj.bias.data.clone() if hasattr(org_module, 'out_proj') and org_module.out_proj.bias is not None else None
+        # -----------------------------------
 
         # Q / K / V projections:  embed_dim → compressed_dim (Q)
         # K/V cache will store (seq_len, Q//H) per head — compressed!
@@ -1089,9 +1103,10 @@ class OPTTuckerTTDecoderLayer(nn.Module):
         b_k: torch.Tensor,
         b_v: torch.Tensor,
         b_o: torch.Tensor,
+        tucker_factors_v: list,
         tucker_factors_q: list = None,
         tucker_factors_k: list = None,
-        tucker_factors_v: list = None,
+        tucker_factors_o: list = None,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -1106,9 +1121,10 @@ class OPTTuckerTTDecoderLayer(nn.Module):
             b_k              = b_k,
             b_v              = b_v,
             b_o              = b_o,
+            tucker_factors_v = tucker_factors_v,
             tucker_factors_q = tucker_factors_q,
             tucker_factors_k = tucker_factors_k,
-            tucker_factors_v = tucker_factors_v,
+            tucker_factors_o = tucker_factors_o,
             embed_dim        = self.embed_dim,
             num_heads        = config.num_attention_heads,
             dropout          = config.attention_dropout,
