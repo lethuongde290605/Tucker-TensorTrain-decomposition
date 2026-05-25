@@ -884,11 +884,9 @@ class OPTTuckerTTAttention(nn.Module):
         b_k: torch.Tensor,
         b_v: torch.Tensor,
         b_o: torch.Tensor,            # Tucker-projected bias for out_proj, shape (P,)
-        tucker_factors_q: list = None,
-        tucker_factors_k: list = None,
-        tucker_factors_v: list = None,
-        embed_dim: int = 768,
-        num_heads: int = 12,
+        tucker_factors_v: list,       # Tucker factors for V: [U_i (n_i, q_i)]
+        embed_dim: int,
+        num_heads: int,
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
@@ -897,9 +895,6 @@ class OPTTuckerTTAttention(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout   = dropout
-        self.tucker_factors_q = tucker_factors_q
-        self.tucker_factors_k = tucker_factors_k
-        self.tucker_factors_v = tucker_factors_v
 
         assert w_q.shape == w_k.shape == w_v.shape, (
             f"w_q, w_k, w_v must have the same shape, "
@@ -1089,9 +1084,7 @@ class OPTTuckerTTDecoderLayer(nn.Module):
         b_k: torch.Tensor,
         b_v: torch.Tensor,
         b_o: torch.Tensor,
-        tucker_factors_q: list = None,
-        tucker_factors_k: list = None,
-        tucker_factors_v: list = None,
+        tucker_factors_v: list,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -1106,8 +1099,6 @@ class OPTTuckerTTDecoderLayer(nn.Module):
             b_k              = b_k,
             b_v              = b_v,
             b_o              = b_o,
-            tucker_factors_q = tucker_factors_q,
-            tucker_factors_k = tucker_factors_k,
             tucker_factors_v = tucker_factors_v,
             embed_dim        = self.embed_dim,
             num_heads        = config.num_attention_heads,

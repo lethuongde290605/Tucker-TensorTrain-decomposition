@@ -99,30 +99,7 @@ def apply_tucker_tt_attention_patch():
 
         is_cross_attention = key_value_states is not None
         bsz, tgt_len, _ = hidden_states.size()
-        
-        query_states_unscaled = self.q_proj(hidden_states)
-        query_states = query_states_unscaled * self.scaling
-        
-        # --- RECONSTRUCTION CALCULATION (DEBUG) ---
-        if hasattr(self, 'tucker_factors_q') and self.tucker_factors_q is not None and not is_cross_attention:
-            if not hasattr(self, 'U_q_full'):
-                U = self.tucker_factors_q[0]
-                for f in self.tucker_factors_q[1:]:
-                    U = torch.kron(U, f)
-                self.U_q_full = U.to(query_states.device)
-            
-            # Reconstruct Q
-            # query_states_unscaled: (bsz, tgt_len, Q_compressed)
-            # U_q_full: (embed_dim, Q_compressed)
-            Q_recon = torch.matmul(query_states_unscaled, self.U_q_full.transpose(0, 1))
-            
-            # We want to measure the error w.r.t the true original Q, but since Q_orig is
-            # not directly available in this compressed model inference, we can compute it
-            # manually if we have access to original weights (not saved), OR we can just
-            # store the norms to analyze later. However, we CAN calculate reconstruction error
-            # relative to its own magnitude, or if you also passed the original w_q, you could do it exactly.
-            self.debug_cache["Q_recon_norm"] = float(Q_recon.norm().item())
-            self.debug_cache["Q_compressed_norm"] = float(query_states_unscaled.norm().item())
+        query_states = self.q_proj(hidden_states) * self.scaling
 
         if is_cross_attention and past_key_value is not None:
             key_states = past_key_value[0]
