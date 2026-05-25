@@ -162,7 +162,7 @@ def eigenattn(
                         tucker_factors = tucker[proj]["factors"]
                         tt_cores       = tensor_train[proj]["factors"]
 
-                        combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores)
+                        combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores, proj_type=proj)
                         new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
 
                         # For Q/K/V the bias comes from the Q/K/V projections;
