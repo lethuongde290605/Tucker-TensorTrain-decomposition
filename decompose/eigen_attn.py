@@ -188,6 +188,8 @@ def eigenattn(
                         b_k              = new_bias["K"],
                         b_v              = new_bias["V"],
                         b_o              = new_bias["O"],
+                        tucker_factors_q = tucker["Q"]["factors"],
+                        tucker_factors_k = tucker["K"]["factors"],
                         tucker_factors_v = tucker["V"]["factors"],
                     ).to(dev)
                     '''
