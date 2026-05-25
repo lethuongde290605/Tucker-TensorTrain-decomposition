@@ -1,27 +1,23 @@
 import torch
-import tensorly as tl
-tl.set_backend('pytorch')
+import math
 
-N = 2
-d1, r1 = 4, 3
-d2, r2 = 5, 2
+def build_u_full(factors):
+    # factors: list of (orig_i, comp_i)
+    # returns U_full of shape (prod(orig_i), prod(comp_i))
+    res = factors[0]
+    for f in factors[1:]:
+        # kronecker product
+        # res: (O_prev, C_prev)
+        # f: (O_new, C_new)
+        O_prev, C_prev = res.shape
+        O_new, C_new = f.shape
+        # res_exp = res.view(O_prev, 1, C_prev, 1)
+        # f_exp = f.view(1, O_new, 1, C_new)
+        # return (res_exp * f_exp).view(O_prev * O_new, C_prev * C_new)
+        res = torch.kron(res, f)
+    return res
 
-U1 = torch.randn(d1, r1)
-U2 = torch.randn(d2, r2)
-C = torch.randn(N, r1, r2)
-
-# Tensorly construct
-T1 = tl.tenalg.multi_mode_dot(C, [U1, U2], modes=[1, 2])
-T1_flat = T1.reshape(N, -1)
-
-# Kronecker construct
-U_kron = torch.kron(U1, U2) # shape (d1*d2, r1*r2)
-print("U_kron shape:", U_kron.shape)
-C_flat = C.reshape(N, -1)
-T2_flat = torch.matmul(C_flat, U_kron.T)
-
-print("Diff kron(U1, U2):", torch.norm(T1_flat - T2_flat).item())
-
-U_kron_rev = torch.kron(U2, U1) 
-print("Diff kron(U2, U1):", torch.norm(T1_flat - torch.matmul(C_flat, U_kron_rev.T)).item())
-
+f1 = torch.randn(4, 2)
+f2 = torch.randn(3, 2)
+res = build_u_full([f1, f2])
+print(res.shape)
