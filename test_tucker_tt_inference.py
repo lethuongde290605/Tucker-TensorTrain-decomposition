@@ -109,7 +109,7 @@ def apply_tucker_tt_attention_patch():
                 U = self.tucker_factors_q[0]
                 for f in self.tucker_factors_q[1:]:
                     U = torch.kron(U, f)
-                self.U_q_full = U.to(query_states.device)
+                self.U_q_full = U.to(query_states.device).to(query_states_unscaled.dtype)
             
             # Reconstruct Q
             # query_states_unscaled: (bsz, tgt_len, Q_compressed)
