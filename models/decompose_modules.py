@@ -939,9 +939,9 @@ class OPTTuckerTTAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, self.compressed_dim, bias=bias)
 
         # Load compressed weights; nn.Linear stores weight as (out, in)
-        self.q_proj.weight.data = w_q.contiguous()   # (Q, embed_dim)
-        self.k_proj.weight.data = w_k.contiguous()
-        self.v_proj.weight.data = w_v.contiguous()
+        self.q_proj.weight.data = w_q.t().contiguous()   # (Q, embed_dim)
+        self.k_proj.weight.data = w_k.t().contiguous()
+        self.v_proj.weight.data = w_v.t().contiguous()
 
         if bias:
             self.q_proj.bias.data = b_q   # (Q,)

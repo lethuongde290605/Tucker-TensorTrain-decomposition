@@ -865,14 +865,29 @@ def project_bias_with_tucker_factors(
 def apply_tucker_factors_to_tt_cores(
     tucker_factors: list,
     tt_cores: list,
-    proj_type: str = "O",
 ) -> list:
     """
     Contract Tucker factors into TT-matrix cores via mode multiplication.
-    For Q, K, V (where Tucker compresses the out_features `m`):
-        new_core_i = einsum('rmnR, mq -> rqnR', core_i, factor_i)
-    For O (where Tucker compresses the in_features `n`):
+
+    For each mode i:
+        tucker_factors[i] has shape  (n_i, q_i)
+        tt_cores[i]       has shape  (r_i, m_i, n_i, r_{i+1})
+
+    The n_i axis is shared and is contracted out:
+        new_core[r, m, q, R] = sum_n  core[r, m, n, R] * factor[n, q]
+
+    This is a mode-2 product of the TT-matrix core with the Tucker factor matrix,
+    equivalent to:
         new_core_i = einsum('rmnR, nq -> rmqR', core_i, factor_i)
+
+    Result shape per core: (r_i, m_i, q_i, r_{i+1})
+
+    Args:
+        tucker_factors: List of k factor matrices, each of shape (n_i, q_i).
+        tt_cores:       List of k TT-matrix cores, each of shape (r_i, m_i, n_i, r_{i+1}).
+
+    Returns:
+        List of k new TT-matrix cores, each of shape (r_i, m_i, q_i, r_{i+1}).
     """
     assert len(tucker_factors) == len(tt_cores), (
         f"Number of Tucker factors ({len(tucker_factors)}) must match "
@@ -881,22 +896,15 @@ def apply_tucker_factors_to_tt_cores(
 
     new_cores = []
     for i, (factor, core) in enumerate(zip(tucker_factors, tt_cores)):
-        if proj_type in ("Q", "K", "V"):
-            assert factor.shape[0] == core.shape[1], (
-                f"Mode {i}: factor.shape[0]={factor.shape[0]} must equal "
-                f"core.shape[1]={core.shape[1]} (the shared m_i dimension)"
-            )
-            # Contract m_i: (r, m, n, R) x (m, q) -> (r, q, n, R)
-            new_core = torch.einsum('rmnR, mq -> rqnR', core, factor)
-            new_cores.append(new_core)
-        else:
-            assert factor.shape[0] == core.shape[2], (
-                f"Mode {i}: factor.shape[0]={factor.shape[0]} must equal "
-                f"core.shape[2]={core.shape[2]} (the shared n_i dimension)"
-            )
-            # Contract n_i: (r, m, n, R) x (n, q) -> (r, m, q, R)
-            new_core = torch.einsum('rmnR, nq -> rmqR', core, factor)
-            new_cores.append(new_core)
+        # factor: (n_i, q_i)
+        # core:   (r_i, m_i, n_i, r_{i+1})
+        assert factor.shape[0] == core.shape[2], (
+            f"Mode {i}: factor.shape[0]={factor.shape[0]} must equal "
+            f"core.shape[2]={core.shape[2]} (the shared n_i dimension)"
+        )
+        # Contract n_i: (r, m, n, R) x (n, q) -> (r, m, q, R)
+        new_core = torch.einsum('rmnR, nq -> rmqR', core, factor)
+        new_cores.append(new_core)
 
     return new_cores
 
