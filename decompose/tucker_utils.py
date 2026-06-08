@@ -359,6 +359,243 @@ def _decompose_one(name: str, tensor, rank: list[int], modes: list[int]) -> dict
     rel_err = reconstruct(tensor, core, factors, modes=modes)
     return {"core": core, "factors": factors, "compression_ratio": comp, "relative_error": rel_err}
 
+import torch
+import math
+
+
+def unfold_tensor(tensor: torch.Tensor, mode: int) -> torch.Tensor:
+    """
+    Matricize tensor theo mode chỉ định.
+
+    Ví dụ tensor shape (8, 8, 12):
+        mode 0 -> (8, 96)
+        mode 1 -> (8, 96)
+        mode 2 -> (12, 64)
+    """
+    ndim = tensor.ndim
+    order = [mode] + [i for i in range(ndim) if i != mode]
+    unfolded = tensor.permute(order).reshape(tensor.shape[mode], -1)
+    return unfolded
+
+
+def fold_matrix(matrix: torch.Tensor, original_shape: tuple, mode: int) -> torch.Tensor:
+    """
+    Fold matrix đã matricize theo mode về lại tensor gốc.
+    """
+    ndim = len(original_shape)
+
+    mode_dim = original_shape[mode]
+    other_dims = [original_shape[i] for i in range(ndim) if i != mode]
+
+    # shape sau khi unfold theo mode:
+    # (mode_dim, dim_others...)
+    tensor_perm = matrix.reshape(mode_dim, *other_dims)
+
+    # inverse permutation
+    order = [mode] + [i for i in range(ndim) if i != mode]
+    inv_order = [0] * ndim
+    for i, j in enumerate(order):
+        inv_order[j] = i
+
+    tensor = tensor_perm.permute(inv_order)
+    return tensor
+
+
+def truncated_svd_reconstruct(matrix: torch.Tensor, rank: int):
+    """
+    Reconstruct matrix bằng truncated SVD rank-r.
+    """
+    U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
+
+    U_r = U[:, :rank]
+    S_r = S[:rank]
+    Vh_r = Vh[:rank, :]
+
+    matrix_rec = (U_r * S_r.unsqueeze(0)) @ Vh_r
+
+    return matrix_rec, S
+
+
+def energy_ratio_from_singular_values(S: torch.Tensor):
+    """
+    Energy = tổng bình phương singular values.
+    """
+    energy = S ** 2
+    total_energy = energy.sum()
+
+    if total_energy.item() == 0:
+        return torch.zeros_like(energy)
+
+    cumulative_energy = torch.cumsum(energy, dim=0) / total_energy
+    return cumulative_energy
+
+
+def rank_for_energy(S: torch.Tensor, target_energy: float):
+    """
+    Tìm rank nhỏ nhất sao cho giữ được target_energy.
+    """
+    cumulative_energy = energy_ratio_from_singular_values(S)
+    rank = int(torch.searchsorted(cumulative_energy, target_energy).item()) + 1
+    return min(rank, S.numel())
+
+
+def inspect_single_token_mode_rank(
+    tensor_q: torch.Tensor,
+    sample_idx: int = 0,
+    token_idx: int = 0,
+    reshape_shape: tuple = (8, 8, 12),
+    target_energies=(0.90, 0.95, 0.99),
+    manual_ranks=None,
+    verbose: bool = True,
+):
+    """
+    Kiểm tra low-rank structure của 1 token trong tensor_q.
+
+    Args:
+        tensor_q:
+            Tensor Q shape (batch/nsamples, seq_len, hidden_dim),
+            ví dụ (2, 2048, 768).
+
+        sample_idx:
+            Chọn sample nào trong batch/nsamples.
+
+        token_idx:
+            Chọn token nào trong seq_len.
+
+        reshape_shape:
+            Shape để reshape hidden_dim.
+            Với OPT-125M hidden_dim = 768, có thể dùng (8, 8, 12).
+
+        target_energies:
+            Các mức energy muốn kiểm tra, ví dụ 90%, 95%, 99%.
+
+        manual_ranks:
+            Nếu muốn kiểm tra thêm rank cụ thể.
+            Ví dụ manual_ranks=[1, 2, 4, 6, 8].
+            Nếu None thì chỉ dùng rank theo target_energies.
+
+    Returns:
+        Dict chứa thông tin từng mode:
+            - unfolded_shape
+            - singular_values
+            - cumulative_energy
+            - energy_ranks
+            - reconstructions
+            - relative_errors
+    """
+    if tensor_q.ndim != 3:
+        raise ValueError(
+            f"Expected tensor_q shape (batch, seq_len, hidden_dim), "
+            f"but got {tuple(tensor_q.shape)}"
+        )
+
+    batch_size, seq_len, hidden_dim = tensor_q.shape
+
+    if sample_idx < 0 or sample_idx >= batch_size:
+        raise ValueError(f"sample_idx={sample_idx} out of range [0, {batch_size - 1}]")
+
+    if token_idx < 0 or token_idx >= seq_len:
+        raise ValueError(f"token_idx={token_idx} out of range [0, {seq_len - 1}]")
+
+    if math.prod(reshape_shape) != hidden_dim:
+        raise ValueError(
+            f"Cannot reshape hidden_dim={hidden_dim} into {reshape_shape}, "
+            f"because product={math.prod(reshape_shape)}"
+        )
+
+    # 1. Lấy 1 token: (768,)
+    token_vec = tensor_q[sample_idx, token_idx].detach()
+
+    # Nên đưa về float32 để SVD ổn định hơn nếu tensor đang là fp16/bf16
+    token_vec = token_vec.to(torch.float32)
+
+    # 2. Reshape: (768,) -> (8, 8, 12)
+    token_tensor = token_vec.reshape(*reshape_shape)
+
+    if manual_ranks is None:
+        manual_ranks = []
+
+    results = {
+        "sample_idx": sample_idx,
+        "token_idx": token_idx,
+        "token_vec_shape": tuple(token_vec.shape),
+        "token_tensor_shape": tuple(token_tensor.shape),
+        "modes": {},
+    }
+
+    if verbose:
+        print("\n=== Single Token Mode-wise Rank Inspection ===")
+        print(f"tensor_q shape       : {tuple(tensor_q.shape)}")
+        print(f"selected token       : sample_idx={sample_idx}, token_idx={token_idx}")
+        print(f"token vector shape   : {tuple(token_vec.shape)}")
+        print(f"reshaped tensor shape: {tuple(token_tensor.shape)}")
+
+    # 3. Matricize theo từng mode
+    for mode in range(token_tensor.ndim):
+        matrix = unfold_tensor(token_tensor, mode)
+
+        # SVD full
+        U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
+        cumulative_energy = energy_ratio_from_singular_values(S)
+
+        # Các rank theo target energy
+        energy_ranks = {
+            float(e): rank_for_energy(S, float(e))
+            for e in target_energies
+        }
+
+        # Union giữa rank theo energy và manual ranks
+        ranks_to_test = sorted(
+            set(energy_ranks.values()).union(set(manual_ranks))
+        )
+
+        # Rank không được vượt quá min(matrix.shape)
+        max_rank = min(matrix.shape)
+        ranks_to_test = [r for r in ranks_to_test if 1 <= r <= max_rank]
+
+        reconstructions = {}
+        relative_errors = {}
+        retained_energies = {}
+
+        for r in ranks_to_test:
+            matrix_rec = (U[:, :r] * S[:r].unsqueeze(0)) @ Vh[:r, :]
+            tensor_rec = fold_matrix(matrix_rec, token_tensor.shape, mode)
+
+            rel_error = torch.linalg.norm(token_tensor - tensor_rec) / torch.linalg.norm(token_tensor)
+
+            reconstructions[r] = tensor_rec
+            relative_errors[r] = float(rel_error.item())
+            retained_energies[r] = float(cumulative_energy[r - 1].item())
+
+        results["modes"][mode] = {
+            "unfolded_shape": tuple(matrix.shape),
+            "singular_values": S.detach().cpu(),
+            "cumulative_energy": cumulative_energy.detach().cpu(),
+            "energy_ranks": energy_ranks,
+            "tested_ranks": ranks_to_test,
+            "retained_energies": retained_energies,
+            "relative_errors": relative_errors,
+            "reconstructions": reconstructions,
+        }
+
+        if verbose:
+            print(f"\n--- Mode {mode} unfolding ---")
+            print(f"matrix shape: {tuple(matrix.shape)}")
+            print(f"max possible rank: {max_rank}")
+
+            print("\nRank needed for target energy:")
+            for e, r in energy_ranks.items():
+                print(f"  energy >= {e:.2f}: rank {r}")
+
+            print("\nReconstruction by truncated SVD:")
+            for r in ranks_to_test:
+                print(
+                    f"  rank={r:<3d} | "
+                    f"energy={retained_energies[r]:.6f} | "
+                    f"rel_error={relative_errors[r]:.6f}"
+                )
+
+    return results
 
 def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compression_ratio=0.7, num_factors=5):
     """
@@ -383,6 +620,15 @@ def tucker_decompose_opt_layer(layer, fp_inps, args, num_heads, layer_id, compre
     # ---- Q / K / V activations -----------------------------------------------
     tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
     print(f"Original Shape - Q: {tensor_q.shape}, K: {tensor_k.shape}, V: {tensor_v.shape}")
+    inspect_result = inspect_single_token_mode_rank(
+        tensor_q=tensor_q,
+        sample_idx=0,
+        token_idx=0,
+        reshape_shape=(8, 8, 12),
+        target_energies=(0.90, 0.95, 0.99),
+        manual_ranks=[1, 2, 4, 6, 8],
+        verbose=True,
+    )
 
     # ---- O (input to out_proj / W_o) activations ------------------------------
     tensor_o = get_out_proj_input_opt(layer, fp_inps, args)
