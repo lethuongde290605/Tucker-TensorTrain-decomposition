@@ -634,9 +634,28 @@ def get_tucker_attn_config(args, hidden_dim: int) -> dict:
         "manual_ranks_v": params.get("manual_ranks_v"),
         "log_reconstruction_error": bool(params.get("log_reconstruction_error", False)),
         "materialize_projection": bool(params.get("materialize_projection", True)),
-        "preserve_heads": bool(params.get("preserve_heads", False)),
+        "preserve_heads": bool(params.get("preserve_heads", True)),
         "modes_were_explicit": modes_were_explicit,
     }
+
+
+def resolve_tucker_modes_for_opt(cfg: dict, num_heads: int) -> dict:
+    """
+    Keep OPT head mode uncompressed by default.
+
+    For hidden_dim reshaped as (num_heads, d1, d2), the prepared tensor shape is
+    (calibration_tokens, num_heads, d1, d2). Tucker feature modes are therefore
+    [1, 2, 3], and preserving heads means decomposing only modes [2, 3].
+    """
+    cfg = cfg.copy()
+    if (
+        cfg.get("preserve_heads", True)
+        and not cfg.get("modes_were_explicit", False)
+        and len(cfg["factor_dims"]) >= 2
+        and cfg["factor_dims"][0] == int(num_heads)
+    ):
+        cfg["modes"] = list(range(2, len(cfg["factor_dims"]) + 1))
+    return cfg
 
 
 def _candidate_ranks_at_least(
@@ -814,6 +833,7 @@ def build_opt_tucker_projection_config(
 ) -> dict:
     hidden_dim = int(tensor_q.shape[-1])
     cfg = get_tucker_attn_config(args, hidden_dim)
+    cfg = resolve_tucker_modes_for_opt(cfg, num_heads)
 
     flat_k = tensor_k.reshape(-1, hidden_dim)
     flat_q = tensor_q.reshape(-1, hidden_dim)

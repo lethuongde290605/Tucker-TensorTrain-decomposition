@@ -13,6 +13,7 @@ from decompose.tucker_utils import (
     tucker_decompose_opt_layer,
     tucker_analyze_opt_kq,
     get_tucker_attn_config,
+    resolve_tucker_modes_for_opt,
     get_opt_tucker_activations,
     build_opt_tucker_projection_config,
     tucker_attention_param_ratio,
@@ -185,6 +186,7 @@ def eigenattn(
 
                     if _use_opt_tucker_attention(args):
                         tucker_cfg = get_tucker_attn_config(args, lm.model.config.hidden_size)
+                        tucker_cfg = resolve_tucker_modes_for_opt(tucker_cfg, num_heads)
                         logger.info(
                             f"layer {i} starting Tucker-only attention search "
                             f"factor_dims:{tucker_cfg['factor_dims']} modes:{tucker_cfg['modes']} "
@@ -248,13 +250,14 @@ def eigenattn(
                                     f"exceeded error_budget:{args.error_budget}; "
                                     f"reverting to threshold:{best_threshold}"
                                 )
+                                break
 
                         if best_config is None:
                             logger.info(
                                 f"layer {i} no Tucker candidate met output error budget; "
-                                f"falling back to full Tucker ranks at threshold 1.0"
+                                f"testing full Tucker ranks at threshold 1.0 before deciding fallback"
                             )
-                            best_config = build_opt_tucker_projection_config(
+                            full_config = build_opt_tucker_projection_config(
                                 tensor_k,
                                 tensor_q,
                                 tensor_v,
@@ -262,32 +265,65 @@ def eigenattn(
                                 num_heads,
                                 1.0,
                             )
-                            qlayer = OPTTuckerAttnDecoderLayer(layer, args, best_config, lm.model.config).to(dev)
+                            qlayer_full = OPTTuckerAttnDecoderLayer(layer, args, full_config, lm.model.config).to(dev)
                             output_lr = torch.stack([
-                                qlayer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                                qlayer_full(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
                                 for j in range(args.nsamples)
                             ])
                             error = torch.norm(output_hr - output_lr) / torch.norm(output_hr)
-                            best_error = error
-                            best_threshold = 1.0
+                            full_compression_ratio = tucker_attention_param_ratio(
+                                lm.model.config.hidden_size,
+                                full_config["qk"]["latent_dim"],
+                                full_config["v"]["latent_dim"],
+                            )
+                            _log_tucker_candidate(
+                                logger,
+                                i,
+                                full_config,
+                                error,
+                                full_compression_ratio,
+                                torch.cuda.max_memory_allocated(lm._device) / 1024**2,
+                            )
+
+                            if error <= args.error_budget:
+                                best_config = full_config
+                                best_error = error
+                                best_threshold = 1.0
+                                qlayer = qlayer_full
+                            else:
+                                logger.info(
+                                    f"layer {i} full Tucker output_error:{error} still exceeds "
+                                    f"error_budget:{args.error_budget}; keeping original decoder layer"
+                                )
+                                qlayer = layer
+                                best_error = torch.tensor(0.0, device=dev)
+                                best_threshold = None
+
+                            del output_lr
+                            if qlayer is not qlayer_full:
+                                del qlayer_full
+                            torch.cuda.empty_cache()
                         else:
                             qlayer = OPTTuckerAttnDecoderLayer(layer, args, best_config, lm.model.config).to(dev)
                             error = best_error
 
-                        compression_ratio = tucker_attention_param_ratio(
-                            lm.model.config.hidden_size,
-                            best_config["qk"]["latent_dim"],
-                            best_config["v"]["latent_dim"],
-                        )
-                        logger.info(
-                            f"layer {i} selected Tucker output_error:{error} "
-                            f"threshold:{best_threshold} "
-                            f"qk_ranks:{best_config['qk']['ranks']} "
-                            f"v_ranks:{best_config['v']['ranks']} "
-                            f"qk_latent:{best_config['qk']['latent_dim']} "
-                            f"v_latent:{best_config['v']['latent_dim']} "
-                            f"compression_ratio:{compression_ratio:.4f}"
-                        )
+                        if best_config is not None:
+                            compression_ratio = tucker_attention_param_ratio(
+                                lm.model.config.hidden_size,
+                                best_config["qk"]["latent_dim"],
+                                best_config["v"]["latent_dim"],
+                            )
+                            logger.info(
+                                f"layer {i} selected Tucker output_error:{best_error} "
+                                f"threshold:{best_threshold} "
+                                f"qk_ranks:{best_config['qk']['ranks']} "
+                                f"v_ranks:{best_config['v']['ranks']} "
+                                f"qk_latent:{best_config['qk']['latent_dim']} "
+                                f"v_latent:{best_config['v']['latent_dim']} "
+                                f"compression_ratio:{compression_ratio:.4f}"
+                            )
+                        else:
+                            logger.info(f"layer {i} selected original decoder layer output_error:0.0")
 
                         del tensor_k, tensor_q, tensor_v
                         torch.cuda.empty_cache()
