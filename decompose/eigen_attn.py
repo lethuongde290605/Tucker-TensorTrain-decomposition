@@ -9,7 +9,7 @@ from decompose.eigen_attn_utils import (decompose_opt_layer, decompose_mpt_layer
                                          apply_tucker_factors_to_tt_cores, reconstruct_combined_tt_cores,
                                          project_bias_with_tucker_factors,
                                         tensor_train_decompose_opt_layer_bias)
-from decompose.tucker_utils import tucker_decompose_opt_layer
+from decompose.tucker_utils import tucker_decompose_opt_layer, tucker_analyze_opt_kq
 from models.decompose_modules import (OPTEigenAttnDecoderLayer, MptBlockEigenAttn, LlamaEigenAttnDecoderLayer,
                                       OPTTuckerTTDecoderLayer)
 
@@ -190,7 +190,7 @@ def eigenattn(
                     #     b_o              = new_bias["O"],
                     #     tucker_factors_v = tucker["V"]["factors"],
                     # ).to(dev)
-                    
+
                     args.eigen_attn_params['threshold'] = 0.98
                     error = 0.0
                     num_heads = lm.model.config.num_attention_heads
@@ -208,6 +208,7 @@ def eigenattn(
                         rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
                         rank_v = num_heads * torch.amax((torch.cumsum(eval_v, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
 
+                        logger.info(f"layer {i} error:{error} threshold:{args.eigen_attn_params['threshold']} rank_kq: {rank_kq} rank_v: {rank_v} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
 
                     #error budget has been reached, revert back to the previous SVD threshold
                     args.eigen_attn_params['threshold'] += 0.04
@@ -218,6 +219,34 @@ def eigenattn(
 
                     output_lr = torch.stack([qlayer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0] for j in range(args.nsamples)])
                     error = (torch.norm(output_hr - output_lr)/torch.norm(output_hr))
+                    logger.info(
+                        f"layer {i} final eigenattention error:{error} "
+                        f"threshold:{args.eigen_attn_params['threshold']} "
+                        f"rank_kq:{rank_kq} rank_v:{rank_v}"
+                    )
+
+                    try:
+                        tucker_qk = tucker_analyze_opt_kq(
+                            layer,
+                            inps,
+                            args,
+                            num_heads,
+                            i,
+                            rank_kq,
+                            feature_factors=(8, 8, 12),
+                            logger=logger,
+                        )
+                        logger.info(
+                            f"layer {i} compare eigen_rank_kq={rank_kq} "
+                            f"tucker_ranks={tucker_qk['ranks']} "
+                            f"tucker_rank_product={tucker_qk['rank_product']} "
+                            f"tucker_qk_energy_min={tucker_qk['min_retained_energy']:.6f} "
+                            f"tucker_qk_energy_mean={tucker_qk['mean_retained_energy']:.6f} "
+                            f"tucker_qk_rel_error={tucker_qk['relative_error']:.6f}"
+                        )
+                        del tucker_qk
+                    except ValueError as e:
+                        logger.info(f"layer {i} Tucker-QK analysis skipped: {e}")
 
                     # del output_hr, output_lr, basis_kq, basis_v
                     del basis_kq, basis_v
@@ -247,6 +276,8 @@ def eigenattn(
                         output_lr = torch.stack([qlayer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_bias = position_bias)[0] for j in range(args.nsamples)])
                         error = (torch.norm(output_hr - output_lr)/torch.norm(output_hr))
                         args.eigen_attn_params['threshold'] -= 0.02
+                        
+                        logger.info(f"layer {i} error:{error} threshold:{args.eigen_attn_params['threshold']} rank_kq: {rank_kq} rank_v: {rank_v} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
 
                     args.eigen_attn_params['threshold'] += 0.04
                     rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))

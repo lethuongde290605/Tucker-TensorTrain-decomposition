@@ -87,6 +87,24 @@ def prepare_tensor(tensor, dim1_factors: list[int]):
     return result
 
 
+def prepare_feature_tensor(tensor: torch.Tensor, dim_factors: list[int]) -> torch.Tensor:
+    """
+    Reshape activation features into Tucker feature modes while preserving mode 0.
+
+    Accepted inputs:
+      - (batch, seq_len, hidden_dim) -> (batch * seq_len, *dim_factors)
+      - (tokens, hidden_dim)         -> (tokens, *dim_factors)
+    """
+    hidden_dim = tensor.shape[-1]
+    if math.prod(dim_factors) != hidden_dim:
+        raise ValueError(
+            f"Cannot reshape hidden_dim={hidden_dim} with factors={dim_factors} "
+            f"(product={math.prod(dim_factors)})"
+        )
+
+    return tensor.reshape(-1, *dim_factors)
+
+
 # ---------------------------------------------------------------------------
 # Rank calculation helpers (module-level, not nested)
 # ---------------------------------------------------------------------------
@@ -437,6 +455,203 @@ def rank_for_energy(S: torch.Tensor, target_energy: float):
     cumulative_energy = energy_ratio_from_singular_values(S)
     rank = int(torch.searchsorted(cumulative_energy, target_energy).item()) + 1
     return min(rank, S.numel())
+
+
+def _rank_product_candidates(dims: list[int], target_product: int) -> list[tuple[int, ...]]:
+    """
+    Enumerate Tucker rank tuples bounded by dims whose product equals target_product.
+    """
+    candidates = []
+
+    def backtrack(idx: int, remaining: int, current: list[int]):
+        if idx == len(dims):
+            if remaining == 1:
+                candidates.append(tuple(current))
+            return
+
+        max_rank = min(dims[idx], remaining)
+        for rank in range(1, max_rank + 1):
+            if remaining % rank == 0:
+                current.append(rank)
+                backtrack(idx + 1, remaining // rank, current)
+                current.pop()
+
+    backtrack(0, int(target_product), [])
+    return candidates
+
+
+def _mode_cumulative_energies(tensor: torch.Tensor, modes: list[int]) -> dict[int, torch.Tensor]:
+    """
+    Compute cumulative SVD energy for each requested Tucker mode.
+    """
+    energies = {}
+    tensor_f32 = tensor.to(torch.float32)
+
+    for mode in modes:
+        matrix = unfold_tensor(tensor_f32, mode)
+        _, singular_values, _ = torch.linalg.svd(matrix, full_matrices=False)
+        energies[mode] = energy_ratio_from_singular_values(singular_values).detach()
+
+    return energies
+
+
+def select_tucker_ranks_by_energy(
+    tensor: torch.Tensor,
+    modes: list[int],
+    target_product: int,
+    logger=None,
+) -> dict:
+    """
+    Select per-mode Tucker ranks whose product equals target_product.
+
+    The selected candidate maximizes the weakest retained mode energy first,
+    then the average retained energy. Mode 0 is excluded by passing modes=[1,2,3].
+    """
+    dims = [int(tensor.shape[m]) for m in modes]
+    target_product = int(target_product)
+    max_product = math.prod(dims)
+
+    if target_product < 1 or target_product > max_product:
+        raise ValueError(
+            f"target_product={target_product} is outside valid Tucker product range "
+            f"[1, {max_product}] for dims={dims}"
+        )
+
+    energies_by_mode = _mode_cumulative_energies(tensor, modes)
+    candidates = _rank_product_candidates(dims, target_product)
+
+    exact_product = True
+    if not candidates:
+        exact_product = False
+        feasible_products = sorted(
+            {
+                math.prod(candidate)
+                for product in range(1, max_product + 1)
+                for candidate in _rank_product_candidates(dims, product)
+            }
+        )
+        fallback_product = min(feasible_products, key=lambda p: (abs(p - target_product), p > target_product))
+        candidates = _rank_product_candidates(dims, fallback_product)
+        if logger:
+            logger.info(
+                f"Tucker QK cannot match rank_kq={target_product} exactly with dims={dims}; "
+                f"using nearest feasible product={fallback_product}"
+            )
+        else:
+            print(
+                f"  [WARN] Tucker QK cannot match rank_kq={target_product} exactly with dims={dims}; "
+                f"using nearest feasible product={fallback_product}"
+            )
+        target_product = fallback_product
+
+    scored = []
+    for candidate in candidates:
+        retained = []
+        for mode, rank in zip(modes, candidate):
+            cumulative = energies_by_mode[mode]
+            retained.append(float(cumulative[rank - 1].item()))
+
+        min_energy = min(retained)
+        mean_energy = sum(retained) / len(retained)
+        balance = _rank_imbalance(dims, list(candidate))
+        scored.append((min_energy, mean_energy, -balance, candidate, retained))
+
+    scored.sort(reverse=True)
+    min_energy, mean_energy, neg_balance, ranks, retained = scored[0]
+
+    return {
+        "ranks": list(ranks),
+        "rank_product": math.prod(ranks),
+        "exact_product": exact_product,
+        "target_product": target_product,
+        "modes": modes,
+        "dims": dims,
+        "retained_energies": retained,
+        "min_retained_energy": min_energy,
+        "mean_retained_energy": mean_energy,
+        "rank_balance": -neg_balance,
+    }
+
+
+def tucker_analyze_opt_kq(
+    layer,
+    fp_inps,
+    args,
+    num_heads,
+    layer_id,
+    rank_kq,
+    feature_factors=(8, 8, 12),
+    logger=None,
+):
+    """
+    Analyze Tucker compression on the same concatenated K/Q activation used by EigenAttention.
+
+    Shape flow:
+      K,Q: (chunks, seq_len, hidden_dim)
+      QK : (2 * chunks * seq_len, hidden_dim)
+      Tucker input: (2 * chunks * seq_len, *feature_factors)
+
+    Partial Tucker is applied only to feature modes [1, 2, 3].
+    """
+    from decompose.eigen_attn_utils import get_kqv_opt
+
+    rank_kq = int(rank_kq.item() if torch.is_tensor(rank_kq) else rank_kq)
+    tensor_k, tensor_q, _ = get_kqv_opt(layer, fp_inps, args)
+
+    qk = torch.cat(
+        [
+            tensor_k.reshape(-1, tensor_k.shape[-1]),
+            tensor_q.reshape(-1, tensor_q.shape[-1]),
+        ],
+        dim=0,
+    )
+    qk = prepare_feature_tensor(qk, list(feature_factors))
+    modes = list(range(1, qk.ndim))
+
+    rank_info = select_tucker_ranks_by_energy(qk, modes, rank_kq, logger=logger)
+    ranks = rank_info["ranks"]
+
+    if logger:
+        logger.info(
+            f"layer {layer_id} Tucker-QK input_shape={tuple(qk.shape)} "
+            f"feature_factors={tuple(feature_factors)} modes={modes}"
+        )
+        logger.info(
+            f"layer {layer_id} Tucker-QK ranks={ranks} product={rank_info['rank_product']} "
+            f"rank_kq={rank_kq} exact_product={rank_info['exact_product']} "
+            f"mode_energy={rank_info['retained_energies']} "
+            f"min_energy={rank_info['min_retained_energy']:.6f} "
+            f"mean_energy={rank_info['mean_retained_energy']:.6f}"
+        )
+    else:
+        print(
+            f"layer {layer_id} Tucker-QK ranks={ranks} product={rank_info['rank_product']} "
+            f"rank_kq={rank_kq} exact_product={rank_info['exact_product']}"
+        )
+        print(
+            f"  mode_energy={rank_info['retained_energies']} "
+            f"min={rank_info['min_retained_energy']:.6f} "
+            f"mean={rank_info['mean_retained_energy']:.6f}"
+        )
+
+    core, factors, compression_ratio = decompose(qk, rank=ranks, modes=modes)
+    relative_error = reconstruct(qk, core, factors, modes=modes)
+
+    if logger:
+        logger.info(
+            f"layer {layer_id} Tucker-QK rel_error={relative_error:.6f} "
+            f"compression_ratio={compression_ratio:.4f}"
+        )
+
+    rank_info.update(
+        {
+            "core": core,
+            "factors": factors,
+            "compression_ratio": compression_ratio,
+            "relative_error": relative_error,
+        }
+    )
+    return rank_info
 
 
 def inspect_single_token_mode_rank(
