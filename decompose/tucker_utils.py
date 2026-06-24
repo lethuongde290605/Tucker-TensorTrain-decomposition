@@ -573,6 +573,294 @@ def select_tucker_ranks_by_energy(
     }
 
 
+def get_tucker_attn_config(args, hidden_dim: int) -> dict:
+    """
+    Read Tucker-attention options using the repo's existing args style.
+
+    Preferred location:
+      args.eigen_attn_params["tucker"] = {...}
+
+    Also accepted:
+      args.tucker_attn_params = {...}
+    """
+    params = {}
+    eigen_params = getattr(args, "eigen_attn_params", {}) or {}
+    if isinstance(eigen_params.get("tucker"), dict):
+        params.update(eigen_params["tucker"])
+    if hasattr(args, "tucker_attn_params") and isinstance(args.tucker_attn_params, dict):
+        params.update(args.tucker_attn_params)
+
+    factor_dims = (
+        params.get("factor_dims")
+        or params.get("feature_factors")
+        or params.get("tucker_factor_dims")
+    )
+    if factor_dims is None:
+        num_factors = int(params.get("num_factors", 3))
+        factor_dims = factorize_dim(hidden_dim, num_factors)
+    factor_dims = [int(x) for x in factor_dims]
+
+    if math.prod(factor_dims) != hidden_dim:
+        raise ValueError(
+            f"Tucker factor_dims={factor_dims} product={math.prod(factor_dims)} "
+            f"must equal hidden_dim={hidden_dim}"
+        )
+
+    modes = params.get("modes") or params.get("decomposed_modes")
+    modes_were_explicit = modes is not None
+    if modes is None:
+        modes = list(range(1, len(factor_dims) + 1))
+    modes = [int(m) for m in modes]
+
+    compress_sample_mode = bool(params.get("compress_sample_mode", False))
+    if 0 in modes and not compress_sample_mode:
+        modes = [m for m in modes if m != 0]
+    if 0 in modes:
+        raise NotImplementedError(
+            "Tucker attention currently folds only feature-mode projections into weights; "
+            "compressing calibration-token mode 0 is not supported."
+        )
+
+    return {
+        "enabled": bool(params.get("enabled", params.get("use_tucker", False))),
+        "factor_dims": factor_dims,
+        "modes": modes,
+        "initial_threshold": float(
+            params.get("initial_threshold", params.get("threshold", eigen_params.get("threshold", 0.98)))
+        ),
+        "threshold_step": float(params.get("threshold_step", params.get("step", 0.02))),
+        "min_threshold": float(params.get("min_threshold", 0.30)),
+        "manual_ranks_kq": params.get("manual_ranks_kq", params.get("manual_ranks_qk")),
+        "manual_ranks_v": params.get("manual_ranks_v"),
+        "log_reconstruction_error": bool(params.get("log_reconstruction_error", False)),
+        "materialize_projection": bool(params.get("materialize_projection", True)),
+        "preserve_heads": bool(params.get("preserve_heads", True)),
+        "modes_were_explicit": modes_were_explicit,
+    }
+
+
+def _candidate_ranks_at_least(
+    dims: list[int],
+    min_ranks: list[int],
+    divisor: int,
+    fixed_product: int = 1,
+) -> list[tuple[int, ...]]:
+    candidates = []
+
+    def backtrack(idx: int, current: list[int]):
+        if idx == len(dims):
+            product = math.prod(current) * fixed_product
+            if product % divisor == 0:
+                candidates.append(tuple(current))
+            return
+
+        for rank in range(min_ranks[idx], dims[idx] + 1):
+            current.append(rank)
+            backtrack(idx + 1, current)
+            current.pop()
+
+    backtrack(0, [])
+    return candidates
+
+
+def _select_mode_ranks_from_energies(
+    energies_by_mode: dict[int, torch.Tensor],
+    modes: list[int],
+    dims: list[int],
+    threshold: float,
+    num_heads: int,
+    manual_ranks=None,
+    fixed_product: int = 1,
+) -> tuple[list[int], list[float]]:
+    if manual_ranks is not None:
+        ranks = [int(r) for r in manual_ranks]
+        if len(ranks) != len(modes):
+            raise ValueError(f"manual_ranks length {len(ranks)} must match modes length {len(modes)}")
+        for rank, dim in zip(ranks, dims):
+            if rank < 1 or rank > dim:
+                raise ValueError(f"manual rank {rank} is outside valid range [1, {dim}]")
+    else:
+        ranks = []
+        for mode in modes:
+            cumulative = energies_by_mode[mode]
+            rank = int(torch.searchsorted(cumulative, float(threshold)).item()) + 1
+            ranks.append(min(rank, cumulative.numel()))
+
+    candidates = _candidate_ranks_at_least(dims, ranks, int(num_heads), fixed_product=fixed_product)
+    if not candidates:
+        raise ValueError(
+            f"No Tucker rank tuple >= {ranks} with dims={dims} and fixed_product={fixed_product} "
+            f"has latent dimension divisible by num_heads={num_heads}"
+        )
+
+    def candidate_key(candidate):
+        retained = [float(energies_by_mode[m][r - 1].item()) for m, r in zip(modes, candidate)]
+        return (math.prod(candidate), -min(retained), -sum(retained) / len(retained), _rank_imbalance(dims, list(candidate)))
+
+    selected = min(candidates, key=candidate_key)
+    retained = [float(energies_by_mode[m][r - 1].item()) for m, r in zip(modes, selected)]
+    return list(selected), retained
+
+
+def materialize_tucker_projection(factors: list[torch.Tensor]) -> torch.Tensor:
+    """
+    Build the Kronecker/product projection P with shape (hidden_dim, latent_dim).
+    """
+    if not factors:
+        raise ValueError("Cannot materialize Tucker projection from an empty factor list")
+
+    projection = factors[0]
+    for factor in factors[1:]:
+        projection = torch.kron(projection, factor)
+    return projection.contiguous()
+
+
+def _tucker_reconstruction_error_from_factors(
+    tensor: torch.Tensor,
+    factors: list[torch.Tensor],
+    modes: list[int],
+) -> float:
+    down_factors = [factor.t().contiguous() for factor in factors]
+    core = multi_mode_dot(tensor.to(torch.float32), down_factors, modes=modes)
+    reconstructed = multi_mode_dot(core, factors, modes=modes)
+    denom = torch.linalg.norm(tensor.to(torch.float32))
+    if denom.item() == 0:
+        return 0.0
+    return float((torch.linalg.norm(tensor.to(torch.float32) - reconstructed) / denom).item())
+
+
+def build_tucker_projection_from_tensor(
+    tensor: torch.Tensor,
+    factor_dims: list[int],
+    modes: list[int],
+    threshold: float,
+    num_heads: int,
+    manual_ranks=None,
+    log_reconstruction_error: bool = False,
+) -> dict:
+    """
+    Build Tucker mode factors and a materialized hidden_dim -> latent_dim projection.
+    """
+    prepared = prepare_feature_tensor(tensor, factor_dims).to(torch.float32)
+    dims = [int(prepared.shape[m]) for m in modes]
+    feature_modes = list(range(1, len(factor_dims) + 1))
+    undecomposed_modes = [m for m in feature_modes if m not in modes]
+    fixed_product = math.prod(int(prepared.shape[m]) for m in undecomposed_modes)
+    energies_by_mode = _mode_cumulative_energies(prepared, modes)
+    ranks, retained = _select_mode_ranks_from_energies(
+        energies_by_mode,
+        modes,
+        dims,
+        threshold,
+        num_heads,
+        manual_ranks=manual_ranks,
+        fixed_product=fixed_product,
+    )
+
+    factors = []
+    factor_by_mode = {}
+    for mode, rank in zip(modes, ranks):
+        matrix = unfold_tensor(prepared, mode)
+        u, _, _ = torch.linalg.svd(matrix, full_matrices=False)
+        factor = u[:, :rank].contiguous()
+        factors.append(factor)
+        factor_by_mode[mode] = factor
+
+    projection_factors = []
+    for mode in feature_modes:
+        if mode in factor_by_mode:
+            projection_factors.append(factor_by_mode[mode])
+        else:
+            dim = int(prepared.shape[mode])
+            projection_factors.append(torch.eye(dim, dtype=prepared.dtype, device=prepared.device))
+
+    projection = materialize_tucker_projection(projection_factors)
+    reconstruction_error = None
+    if log_reconstruction_error:
+        reconstruction_error = _tucker_reconstruction_error_from_factors(prepared, factors, modes)
+
+    latent_dim = int(projection.shape[1])
+    return {
+        "projection": projection,
+        "factors": factors,
+        "projection_factors": projection_factors,
+        "ranks": ranks,
+        "latent_dim": latent_dim,
+        "retained_energies": retained,
+        "min_retained_energy": min(retained),
+        "mean_retained_energy": sum(retained) / len(retained),
+        "reconstruction_error": reconstruction_error,
+        "prepared_shape": tuple(prepared.shape),
+        "modes": modes,
+        "factor_dims": factor_dims,
+    }
+
+
+@torch.no_grad()
+def get_opt_tucker_activations(layer, fp_inps, args):
+    from decompose.eigen_attn_utils import get_kqv_opt
+
+    tensor_k, tensor_q, tensor_v = get_kqv_opt(layer, fp_inps, args)
+    return tensor_k, tensor_q, tensor_v
+
+
+def build_opt_tucker_projection_config(
+    tensor_k: torch.Tensor,
+    tensor_q: torch.Tensor,
+    tensor_v: torch.Tensor,
+    args,
+    num_heads: int,
+    threshold: float,
+) -> dict:
+    hidden_dim = int(tensor_q.shape[-1])
+    cfg = get_tucker_attn_config(args, hidden_dim)
+    if (
+        cfg["preserve_heads"]
+        and not cfg["modes_were_explicit"]
+        and len(cfg["factor_dims"]) >= 2
+        and cfg["factor_dims"][0] == int(num_heads)
+    ):
+        cfg["modes"] = list(range(2, len(cfg["factor_dims"]) + 1))
+
+    flat_k = tensor_k.reshape(-1, hidden_dim)
+    flat_q = tensor_q.reshape(-1, hidden_dim)
+    flat_v = tensor_v.reshape(-1, hidden_dim)
+    flat_kq = torch.cat([flat_k, flat_q], dim=0)
+
+    qk = build_tucker_projection_from_tensor(
+        flat_kq,
+        cfg["factor_dims"],
+        cfg["modes"],
+        threshold,
+        num_heads,
+        manual_ranks=cfg["manual_ranks_kq"],
+        log_reconstruction_error=cfg["log_reconstruction_error"],
+    )
+    v = build_tucker_projection_from_tensor(
+        flat_v,
+        cfg["factor_dims"],
+        cfg["modes"],
+        threshold,
+        num_heads,
+        manual_ranks=cfg["manual_ranks_v"],
+        log_reconstruction_error=cfg["log_reconstruction_error"],
+    )
+
+    return {
+        "threshold": float(threshold),
+        "factor_dims": cfg["factor_dims"],
+        "modes": cfg["modes"],
+        "qk": qk,
+        "v": v,
+    }
+
+
+def tucker_attention_param_ratio(embed_dim: int, qk_latent_dim: int, v_latent_dim: int) -> float:
+    original = 4 * embed_dim * embed_dim
+    compressed = (2 * qk_latent_dim * embed_dim) + (2 * v_latent_dim * embed_dim)
+    return compressed / original
+
+
 def tucker_analyze_opt_kq(
     layer,
     fp_inps,

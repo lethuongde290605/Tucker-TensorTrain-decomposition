@@ -243,6 +243,191 @@ class OPTEigenAttention(nn.Module):
         return attn_output, attn_weights_reshaped, past_key_value
 
 
+class OPTTuckerAttention(nn.Module):
+    """OPT self-attention with Tucker-projected Q/K/V spaces."""
+
+    def __init__(
+        self,
+        org_module: nn.Module,
+        projection_kq: torch.Tensor,
+        projection_v: torch.Tensor,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        is_decoder: bool = False,
+        bias: bool = True,
+        args=None,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+
+        if (self.head_dim * num_heads) != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
+                f" and `num_heads`: {num_heads})."
+            )
+
+        self.rank_kq = int(projection_kq.shape[1])
+        self.rank_v = int(projection_v.shape[1])
+        if self.rank_kq % num_heads != 0:
+            raise ValueError(f"Tucker Q/K latent dim {self.rank_kq} must be divisible by num_heads={num_heads}")
+        if self.rank_v % num_heads != 0:
+            raise ValueError(f"Tucker V latent dim {self.rank_v} must be divisible by num_heads={num_heads}")
+
+        self.scaling = self.head_dim**-0.5
+        self.is_decoder = is_decoder
+
+        org_weight_k = org_module.k_proj.weight
+        org_bias_k = org_module.k_proj.bias
+
+        org_weight_q = org_module.q_proj.weight
+        org_bias_q = org_module.q_proj.bias
+
+        org_weight_v = org_module.v_proj.weight
+        org_bias_v = org_module.v_proj.bias
+
+        projection_kq = projection_kq.to(device=org_weight_q.device, dtype=org_weight_q.dtype)
+        projection_v = projection_v.to(device=org_weight_v.device, dtype=org_weight_v.dtype)
+
+        self.k_proj = torch.nn.Linear(self.embed_dim, self.rank_kq, bias=bias)
+        self.q_proj = torch.nn.Linear(self.embed_dim, self.rank_kq, bias=bias)
+        self.v_proj = torch.nn.Linear(self.embed_dim, self.rank_v, bias=bias)
+
+        self.k_proj.weight.data = torch.matmul(projection_kq.t(), org_weight_k).contiguous()
+        self.q_proj.weight.data = torch.matmul(projection_kq.t(), org_weight_q).contiguous()
+        self.v_proj.weight.data = torch.matmul(projection_v.t(), org_weight_v).contiguous()
+
+        if bias:
+            self.k_proj.bias.data = torch.matmul(projection_kq.t(), org_bias_k).contiguous()
+            self.q_proj.bias.data = torch.matmul(projection_kq.t(), org_bias_q).contiguous()
+            self.v_proj.bias.data = torch.matmul(projection_v.t(), org_bias_v).contiguous()
+
+        org_weight_out = org_module.out_proj.weight
+        org_bias_out = org_module.out_proj.bias
+        self.out_proj_up = torch.nn.Linear(self.rank_v, self.embed_dim, bias=bias)
+        self.out_proj_up.weight.data = torch.matmul(org_weight_out, projection_v).contiguous()
+        if bias:
+            self.out_proj_up.bias.data = org_bias_out.data.clone()
+
+    def _new_shape(self, tensor: torch.Tensor, seq_len: int, bsz: int, low_dim: int):
+        return tensor.view(bsz, seq_len, self.num_heads, low_dim // self.num_heads).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Input shape: Batch x Time x Channel"""
+        is_cross_attention = key_value_states is not None
+
+        bsz, tgt_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states) * self.scaling
+
+        if is_cross_attention and past_key_value is not None:
+            key_states = past_key_value[0]
+            value_states = past_key_value[1]
+        elif is_cross_attention:
+            key_states = self.k_proj(key_value_states)
+            key_states = self._new_shape(key_states, -1, bsz, self.rank_kq)
+            value_states = self._new_shape(self.v_proj(key_value_states), -1, bsz, self.rank_v)
+        elif past_key_value is not None:
+            key_states = self.k_proj(hidden_states)
+            key_states = self._new_shape(key_states, -1, bsz, self.rank_kq)
+            value_states = self.v_proj(hidden_states)
+            value_states = self._new_shape(value_states, -1, bsz, self.rank_v)
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        else:
+            key_states = self.k_proj(hidden_states)
+            key_states = self._new_shape(key_states, -1, bsz, self.rank_kq)
+
+            value_states = self.v_proj(hidden_states)
+            value_states = self._new_shape(value_states, -1, bsz, self.rank_v)
+
+        if self.is_decoder:
+            past_key_value = (key_states, value_states)
+
+        proj_shape_kq = (bsz * self.num_heads, -1, self.rank_kq // self.num_heads)
+        proj_shape_v = (bsz * self.num_heads, -1, self.rank_v // self.num_heads)
+
+        query_states = self._new_shape(query_states, tgt_len, bsz, self.rank_kq).view(*proj_shape_kq)
+        key_states = key_states.view(*proj_shape_kq)
+        value_states = value_states.view(*proj_shape_v)
+
+        src_len = key_states.size(1)
+        attn_weights = torch.matmul(query_states, key_states.transpose(1, 2))
+
+        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = (
+                attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                + attention_mask
+            )
+            attn_weights = torch.max(
+                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
+            )
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+        if attn_weights.dtype == torch.float16:
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(torch.float16)
+        else:
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        if layer_head_mask is not None:
+            if layer_head_mask.size() != (self.num_heads,):
+                raise ValueError(
+                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                    f" {layer_head_mask.size()}"
+                )
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+        if output_attentions:
+            attn_weights_reshaped = attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
+            attn_weights = attn_weights_reshaped.view(
+                bsz * self.num_heads, tgt_len, src_len
+            )
+        else:
+            attn_weights_reshaped = None
+
+        attn_output = torch.matmul(attn_weights, value_states)
+        if attn_output.size() != (bsz * self.num_heads, tgt_len, self.rank_v // self.num_heads):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.rank_v // self.num_heads)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.rank_v // self.num_heads)
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(bsz, tgt_len, self.rank_v)
+        attn_output = self.out_proj_up(attn_output)
+
+        return attn_output, attn_weights_reshaped, past_key_value
+
+
 class OPTEigenAttnDecoderLayer(nn.Module):
     def __init__(self, 
                 ori_layer,
@@ -351,6 +536,95 @@ class OPTEigenAttnDecoderLayer(nn.Module):
 
         hidden_states = (residual + hidden_states).view(hidden_states_shape)
         # residual.add_(hidden_states.to(residual.dtype))
+        if not self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+        return outputs
+
+
+class OPTTuckerAttnDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        ori_layer,
+        args,
+        tucker_config,
+        config,
+    ):
+        super().__init__()
+        self.embed_dim = config.hidden_size
+        self.self_attn = OPTTuckerAttention(
+            org_module=ori_layer.self_attn,
+            projection_kq=tucker_config["qk"]["projection"],
+            projection_v=tucker_config["v"]["projection"],
+            embed_dim=self.embed_dim,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_dropout,
+            is_decoder=True,
+            bias=config.enable_bias,
+            args=args,
+        )
+        self.tucker_config = tucker_config
+        self.do_layer_norm_before = config.do_layer_norm_before
+        self.dropout = config.dropout
+        self.self_attn_layer_norm = ori_layer.self_attn_layer_norm
+
+        self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
+        self.fc1.weight.data = ori_layer.fc1.weight.data
+        self.fc1.bias.data = ori_layer.fc1.bias.data
+
+        self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
+        self.fc2.weight.data = ori_layer.fc2.weight.data
+        self.fc2.bias.data = ori_layer.fc2.bias.data
+
+        self.final_layer_norm = ori_layer.final_layer_norm
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        **kwargs
+    ):
+        residual = hidden_states
+        if self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
+            output_attentions=output_attentions,
+        )
+
+        hidden_states = nn.functional.dropout(hidden_states, p=0.0, training=False)
+        hidden_states = residual + hidden_states
+
+        if not self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        hidden_states_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+        residual = hidden_states
+
+        if self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = F.relu(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+
+        hidden_states = (residual + hidden_states).view(hidden_states_shape)
         if not self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
 

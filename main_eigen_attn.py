@@ -301,6 +301,13 @@ def main():
     parser.add_argument("--avg_dim", type = int)
     parser.add_argument("--error_budget", type = float, default = 0.025)
     parser.add_argument("--fine_tune", action="store_true", help="if you want to finetune model after compressing")
+    parser.add_argument("--use_tucker_attn", action="store_true", help="use Tucker-only attention instead of EigenAttention for OPT")
+    parser.add_argument("--tucker_factor_dims", type=int, nargs="+", default=None, help="feature factorization for Tucker attention, e.g. 8 8 12 for OPT-125M")
+    parser.add_argument("--tucker_initial_threshold", type=float, default=0.98)
+    parser.add_argument("--tucker_threshold_step", type=float, default=0.02)
+    parser.add_argument("--tucker_min_threshold", type=float, default=0.30)
+    parser.add_argument("--tucker_no_preserve_heads", action="store_true", help="allow Tucker projection to mix OPT attention heads")
+    parser.add_argument("--tucker_log_reconstruction_error", action="store_true", help="log Tucker tensor reconstruction error for debugging only")
 
 
     args = parser.parse_args()
@@ -381,6 +388,15 @@ def main():
             "threshold": 1.0,
             "avg_dim_features": args.avg_dim,
             "error_budget" : args.error_budget,
+            "tucker": {
+                "enabled": args.use_tucker_attn,
+                "factor_dims": args.tucker_factor_dims,
+                "initial_threshold": args.tucker_initial_threshold,
+                "threshold_step": args.tucker_threshold_step,
+                "min_threshold": args.tucker_min_threshold,
+                "preserve_heads": not args.tucker_no_preserve_heads,
+                "log_reconstruction_error": args.tucker_log_reconstruction_error,
+            },
         }
     if not args.load_low_rank:
         eigenattn(
