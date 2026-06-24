@@ -143,61 +143,65 @@ def eigenattn(
         if is_opt:
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
+                    # args.eigen_attn_params['threshold'] = 0.98
+                    # error = 0.0
+                    # num_heads = lm.model.config.num_attention_heads
+                    # # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
+                    # tucker       = tucker_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
+                    # tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
+                    # tensor_train_o = tensor_train_decompose_opt_layer_out_proj(layer, inps, args, num_heads, i, num_factors=5)
+                    # # Merge O result into the tensor_train dict so the loop below handles all four projections
+                    # tensor_train["O"] = tensor_train_o["O"]
+                    # # ---- build compressed Q / K / V weight matrices --------
+                    # # tucker["Q/K/V"]["factors"]       : list of k Tucker factor matrices (n_i, q_i)
+                    # # tensor_train["Q/K/V"]["factors"] : list of k TT-matrix cores (r_i, m_i, n_i, r_{i+1})
+                    # new_weights = {}
+                    # new_bias    = {}
+
+                    # for proj in ("Q", "K", "V", "O"):
+                    #     tucker_factors = tucker[proj]["factors"]
+                    #     tt_cores       = tensor_train[proj]["factors"]
+
+                    #     combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores)
+                    #     new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
+
+                    #     # For Q/K/V the bias comes from the Q/K/V projections;
+                    #     # for O the bias comes from out_proj.
+                    #     proj_name_map = {
+                    #         "Q": "q_proj", "K": "k_proj",
+                    #         "V": "v_proj", "O": "out_proj",
+                    #     }
+                    #     orig_bias = getattr(layer.self_attn, proj_name_map[proj]).bias.data
+                    #     new_bias[proj] = project_bias_with_tucker_factors(orig_bias, tucker_factors)
+
+                    #     logger.info(f"New weight {proj} shape: {new_weights[proj].shape}")
+                    #     logger.info(f"New bias {proj} shape: {new_bias[proj].shape}")
+
+                    # qlayer = OPTTuckerTTDecoderLayer(
+                    #     ori_layer        = layer,
+                    #     config           = lm.model.config,
+                    #     w_q              = new_weights["Q"],
+                    #     w_k              = new_weights["K"],
+                    #     w_v              = new_weights["V"],
+                    #     w_o              = new_weights["O"],
+                    #     b_q              = new_bias["Q"],
+                    #     b_k              = new_bias["K"],
+                    #     b_v              = new_bias["V"],
+                    #     b_o              = new_bias["O"],
+                    #     tucker_factors_v = tucker["V"]["factors"],
+                    # ).to(dev)
+                    
                     args.eigen_attn_params['threshold'] = 0.98
                     error = 0.0
                     num_heads = lm.model.config.num_attention_heads
-                    # basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
-                    tucker       = tucker_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
-                    tensor_train = tensor_train_decompose_opt_layer(layer, inps, args, num_heads, i, num_factors=5)
-                    tensor_train_o = tensor_train_decompose_opt_layer_out_proj(layer, inps, args, num_heads, i, num_factors=5)
-                    # Merge O result into the tensor_train dict so the loop below handles all four projections
-                    tensor_train["O"] = tensor_train_o["O"]
-                    # ---- build compressed Q / K / V weight matrices --------
-                    # tucker["Q/K/V"]["factors"]       : list of k Tucker factor matrices (n_i, q_i)
-                    # tensor_train["Q/K/V"]["factors"] : list of k TT-matrix cores (r_i, m_i, n_i, r_{i+1})
-                    new_weights = {}
-                    new_bias    = {}
-
-                    for proj in ("Q", "K", "V", "O"):
-                        tucker_factors = tucker[proj]["factors"]
-                        tt_cores       = tensor_train[proj]["factors"]
-
-                        combined_cores = apply_tucker_factors_to_tt_cores(tucker_factors, tt_cores)
-                        new_weights[proj] = reconstruct_combined_tt_cores(combined_cores)
-
-                        # For Q/K/V the bias comes from the Q/K/V projections;
-                        # for O the bias comes from out_proj.
-                        proj_name_map = {
-                            "Q": "q_proj", "K": "k_proj",
-                            "V": "v_proj", "O": "out_proj",
-                        }
-                        orig_bias = getattr(layer.self_attn, proj_name_map[proj]).bias.data
-                        new_bias[proj] = project_bias_with_tucker_factors(orig_bias, tucker_factors)
-
-                        logger.info(f"New weight {proj} shape: {new_weights[proj].shape}")
-                        logger.info(f"New bias {proj} shape: {new_bias[proj].shape}")
-
-                    qlayer = OPTTuckerTTDecoderLayer(
-                        ori_layer        = layer,
-                        config           = lm.model.config,
-                        w_q              = new_weights["Q"],
-                        w_k              = new_weights["K"],
-                        w_v              = new_weights["V"],
-                        w_o              = new_weights["O"],
-                        b_q              = new_bias["Q"],
-                        b_k              = new_bias["K"],
-                        b_v              = new_bias["V"],
-                        b_o              = new_bias["O"],
-                        tucker_factors_v = tucker["V"]["factors"],
-                    ).to(dev)
-                    '''
-                    return tensor_train
+                    basis_kq, eval_kq, basis_v, eval_v = decompose_opt_layer(layer, inps, args, num_heads, i)
 
                     rank_kq = num_heads * torch.amax((torch.cumsum(eval_kq, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
                     rank_v = num_heads * torch.amax((torch.cumsum(eval_v, dim = 1) < args.eigen_attn_params['threshold']).sum(1))
 
                     output_hr = torch.stack([layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0] for j in range(args.nsamples)])
                     while error < args.error_budget and args.eigen_attn_params['threshold']> 0.3 and rank_kq > 64 and rank_v > 64:
+                        qlayer = DecoderLayer(layer, args, basis_kq, rank_kq, basis_v, rank_v, lm.model.config).to(dev)
                         output_lr = torch.stack([qlayer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0] for j in range(args.nsamples)])
                         error = (torch.norm(output_hr - output_lr)/torch.norm(output_hr))
                         args.eigen_attn_params['threshold'] -= 0.02
@@ -218,7 +222,6 @@ def eigenattn(
                     # del output_hr, output_lr, basis_kq, basis_v
                     del basis_kq, basis_v
                     torch.cuda.empty_cache()
-                    '''
 
                     # obtain output of model for propagation to next layer
                     with torch.no_grad():

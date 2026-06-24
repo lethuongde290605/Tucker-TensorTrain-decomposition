@@ -236,22 +236,19 @@ def calculate_rank(tensor_shape: tuple, modes: list[int], target_ratio: float) -
 # Decompose & Reconstruct (split from original test_partial_tucker)
 # ---------------------------------------------------------------------------
 
-def decompose(tensor, rank, modes):
+def decompose(tensor, rank):
     """
-    Decompose a tensor using Partial Tucker decomposition.
+    Decompose a tensor using Tucker decomposition on all modes.
 
     Args:
         tensor: Input numpy array.
-        rank:   Tucker ranks for the specified modes.
-        modes:  List of mode indices to decompose.
+        rank:   Tucker ranks for all modes.
 
     Returns:
         core:    The Tucker core tensor.
         factors: List of factor matrices.
     """
-    (core, factors), rec_errors = partial_tucker(
-        tensor, rank=rank, modes=modes, n_iter_max=200, verbose=True
-    )
+    core, factors = tucker(tensor, rank=rank, n_iter_max=200, verbose=True)
 
     print("core shape: ", core.shape)
     print("factor shapes:")
@@ -272,21 +269,19 @@ def decompose(tensor, rank, modes):
     return core, factors, compression_ratio
 
 
-def reconstruct(tensor, core, factors, modes):
+def reconstruct(tensor, core, factors):
     """
-    Reconstruct the original tensor from a Partial Tucker decomposition and
-    compute reconstruction error metrics.
+    Reconstruct the original tensor from a Tucker decomposition and compute
+    reconstruction error metrics.
 
     Args:
         tensor:  Original numpy array (used for error calculation).
         core:    Tucker core tensor.
         factors: List of factor matrices from decomposition.
-        modes:   List of mode indices that were decomposed.
-
     Returns:
         relative_error: Frobenius-norm relative error.
     """
-    reconstructed_tensor = multi_mode_dot(core, factors, modes=modes)
+    reconstructed_tensor = tucker_to_tensor((core, factors))
 
     tensor_t = torch.from_numpy(tensor)
     reconstructed_t = torch.from_numpy(reconstructed_tensor)
@@ -313,18 +308,12 @@ def reconstruct(tensor, core, factors, modes):
 if __name__ == "__main__":
 
     rng = tl.check_random_state(1234)
-    rand_tensor = tl.tensor(rng.standard_normal((1024, 768)))
+    rand_tensor = tl.tensor(rng.standard_normal((8, 8, 12)))
     print(f"Original tensor shape: {rand_tensor.shape}")
-    # rand_tensor = tl.tensor(rng.random((1024, 768)))
+    # rand_tensor = tl.tensor(rng.random((8, 8, 12)))
 
-    # Factorize the second dimension (768) into 5 sub-dims
-    dim1_factors = factorize_dim(rand_tensor.shape[1], count=3)
-    print(f"Dim-1 factors (768 -> {dim1_factors})")
-
-    tensor = prepare_tensor(rand_tensor, dim1_factors)
-    print(f"Tensor shape after prepare_tensor: {tensor.shape}")
-
-    modes = list(range(1, tensor.ndim))
+    tensor = rand_tensor
+    modes = list(range(tensor.ndim))
 
     errors = []
     compressions = []
@@ -334,8 +323,8 @@ if __name__ == "__main__":
         print(f"\n{'='*50}")
         print(f"Compression Ratio: {i}")
         print(f"Rank: {rank}")
-        core, factors, comp = decompose(tensor, rank=rank, modes=modes)
-        rel_err = reconstruct(tensor, core, factors, modes=modes)
+        core, factors, comp = decompose(tensor, rank=rank)
+        rel_err = reconstruct(tensor, core, factors)
 
         errors.append(rel_err)
         compressions.append(comp)
