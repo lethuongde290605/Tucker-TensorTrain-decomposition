@@ -185,13 +185,6 @@ def eigenattn(
 
                     if _use_opt_tucker_attention(args):
                         tucker_cfg = get_tucker_attn_config(args, lm.model.config.hidden_size)
-                        if (
-                            tucker_cfg["preserve_heads"]
-                            and not tucker_cfg["modes_were_explicit"]
-                            and len(tucker_cfg["factor_dims"]) >= 2
-                            and tucker_cfg["factor_dims"][0] == int(num_heads)
-                        ):
-                            tucker_cfg["modes"] = list(range(2, len(tucker_cfg["factor_dims"]) + 1))
                         logger.info(
                             f"layer {i} starting Tucker-only attention search "
                             f"factor_dims:{tucker_cfg['factor_dims']} modes:{tucker_cfg['modes']} "
@@ -204,8 +197,9 @@ def eigenattn(
                         best_config = None
                         best_error = None
                         best_threshold = None
+                        error = torch.tensor(0.0, device=dev)
 
-                        while threshold >= tucker_cfg["min_threshold"]:
+                        while error <= args.error_budget and threshold >= tucker_cfg["min_threshold"]:
                             candidate_config = build_opt_tucker_projection_config(
                                 tensor_k,
                                 tensor_q,
@@ -249,7 +243,11 @@ def eigenattn(
                             del qlayer_candidate, output_lr
                             torch.cuda.empty_cache()
                             if not candidate_valid:
-                                break
+                                logger.info(
+                                    f"layer {i} stopping Tucker search because output_error:{error} "
+                                    f"exceeded error_budget:{args.error_budget}; "
+                                    f"reverting to threshold:{best_threshold}"
+                                )
 
                         if best_config is None:
                             logger.info(

@@ -634,7 +634,7 @@ def get_tucker_attn_config(args, hidden_dim: int) -> dict:
         "manual_ranks_v": params.get("manual_ranks_v"),
         "log_reconstruction_error": bool(params.get("log_reconstruction_error", False)),
         "materialize_projection": bool(params.get("materialize_projection", True)),
-        "preserve_heads": bool(params.get("preserve_heads", True)),
+        "preserve_heads": bool(params.get("preserve_heads", False)),
         "modes_were_explicit": modes_were_explicit,
     }
 
@@ -814,13 +814,6 @@ def build_opt_tucker_projection_config(
 ) -> dict:
     hidden_dim = int(tensor_q.shape[-1])
     cfg = get_tucker_attn_config(args, hidden_dim)
-    if (
-        cfg["preserve_heads"]
-        and not cfg["modes_were_explicit"]
-        and len(cfg["factor_dims"]) >= 2
-        and cfg["factor_dims"][0] == int(num_heads)
-    ):
-        cfg["modes"] = list(range(2, len(cfg["factor_dims"]) + 1))
 
     flat_k = tensor_k.reshape(-1, hidden_dim)
     flat_q = tensor_q.reshape(-1, hidden_dim)
