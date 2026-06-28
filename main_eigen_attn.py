@@ -405,8 +405,6 @@ def main():
             dataloader,
             logger,
         )
-
-        return
     else:
         print("You are already loading a low rank compressed model.")
 
