@@ -38,6 +38,7 @@ def _log_tucker_candidate(logger, layer_id, tucker_config, output_error, compres
     logger.info(
         f"layer {layer_id} Tucker candidate "
         f"threshold:{tucker_config['threshold']} "
+        f"headwise:{tucker_config.get('headwise', False)} "
         f"qk_ranks:{qk['ranks']} v_ranks:{v['ranks']} "
         f"qk_latent:{qk['latent_dim']} v_latent:{v['latent_dim']} "
         f"qk_energy:{qk['retained_energies']} v_energy:{v['retained_energies']} "

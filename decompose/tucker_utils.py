@@ -652,8 +652,16 @@ def resolve_tucker_modes_for_opt(cfg: dict, num_heads: int) -> dict:
         cfg.get("preserve_heads", True)
         and not cfg.get("modes_were_explicit", False)
         and len(cfg["factor_dims"]) >= 2
-        and cfg["factor_dims"][0] == int(num_heads)
     ):
+        if cfg["factor_dims"][0] != int(num_heads):
+            hidden_dim = math.prod(cfg["factor_dims"])
+            if hidden_dim % int(num_heads) != 0:
+                raise ValueError(
+                    f"Cannot preserve OPT heads for factor_dims={cfg['factor_dims']} "
+                    f"and num_heads={num_heads}"
+                )
+            head_dim = hidden_dim // int(num_heads)
+            cfg["factor_dims"] = [int(num_heads)] + factorize_dim(head_dim, len(cfg["factor_dims"]) - 1)
         cfg["modes"] = list(range(2, len(cfg["factor_dims"]) + 1))
     return cfg
 
@@ -734,6 +742,24 @@ def materialize_tucker_projection(factors: list[torch.Tensor]) -> torch.Tensor:
     return projection.contiguous()
 
 
+def materialize_headwise_tucker_projection(head_projection_factors: list[list[torch.Tensor]]) -> torch.Tensor:
+    """
+    Build a block-diagonal projection with one Tucker projection per attention head.
+
+    Each head projection maps head_dim -> per_head_latent_dim. The final matrix
+    maps hidden_dim -> num_heads * per_head_latent_dim, matching OPT's head-major
+    hidden layout.
+    """
+    if not head_projection_factors:
+        raise ValueError("Cannot materialize headwise Tucker projection without head factors")
+
+    head_projections = [
+        materialize_tucker_projection(factors)
+        for factors in head_projection_factors
+    ]
+    return torch.block_diag(*head_projections).contiguous()
+
+
 def _tucker_reconstruction_error_from_factors(
     tensor: torch.Tensor,
     factors: list[torch.Tensor],
@@ -746,6 +772,23 @@ def _tucker_reconstruction_error_from_factors(
     if denom.item() == 0:
         return 0.0
     return float((torch.linalg.norm(tensor.to(torch.float32) - reconstructed) / denom).item())
+
+
+def _headwise_tucker_reconstruction_error_from_factors(
+    prepared: torch.Tensor,
+    head_factors: list[list[torch.Tensor]],
+    local_modes: list[int],
+) -> dict:
+    errors = []
+    for head_idx, factors in enumerate(head_factors):
+        head_tensor = prepared[:, head_idx, ...].to(torch.float32)
+        errors.append(_tucker_reconstruction_error_from_factors(head_tensor, factors, local_modes))
+
+    return {
+        "max": max(errors) if errors else 0.0,
+        "mean": sum(errors) / len(errors) if errors else 0.0,
+        "per_head": errors,
+    }
 
 
 def _partial_tucker_factors(
@@ -788,6 +831,184 @@ def _partial_tucker_factors(
         factors = [factor.to(original_device) for factor in factors]
 
     return [factor.contiguous() for factor in factors]
+
+
+def _headwise_mode_cumulative_energies(
+    prepared: torch.Tensor,
+    local_modes: list[int],
+) -> list[dict[int, torch.Tensor]]:
+    energies = []
+    for head_idx in range(int(prepared.shape[1])):
+        head_tensor = prepared[:, head_idx, ...]
+        energies.append(_mode_cumulative_energies(head_tensor, local_modes))
+    return energies
+
+
+def _select_headwise_mode_ranks_from_energies(
+    energies_by_head: list[dict[int, torch.Tensor]],
+    local_modes: list[int],
+    dims: list[int],
+    threshold: float,
+    manual_ranks=None,
+    fixed_product: int = 1,
+) -> tuple[list[int], list[float], list[list[float]]]:
+    if manual_ranks is not None:
+        min_ranks = [int(r) for r in manual_ranks]
+        if len(min_ranks) != len(local_modes):
+            raise ValueError(f"manual_ranks length {len(min_ranks)} must match modes length {len(local_modes)}")
+        for rank, dim in zip(min_ranks, dims):
+            if rank < 1 or rank > dim:
+                raise ValueError(f"manual rank {rank} is outside valid range [1, {dim}]")
+    else:
+        per_head_min_ranks = []
+        for energies in energies_by_head:
+            ranks = []
+            for mode in local_modes:
+                cumulative = energies[mode]
+                rank = int(torch.searchsorted(cumulative, float(threshold)).item()) + 1
+                ranks.append(min(rank, cumulative.numel()))
+            per_head_min_ranks.append(ranks)
+
+        min_ranks = [
+            max(head_ranks[mode_idx] for head_ranks in per_head_min_ranks)
+            for mode_idx in range(len(local_modes))
+        ]
+
+    candidates = _candidate_ranks_at_least(dims, min_ranks, divisor=1, fixed_product=fixed_product)
+    if not candidates:
+        raise ValueError(
+            f"No headwise Tucker rank tuple >= {min_ranks} with dims={dims} "
+            f"and fixed_product={fixed_product}"
+        )
+
+    def retained_for(candidate):
+        per_head_retained = []
+        flat_retained = []
+        for energies in energies_by_head:
+            retained = [
+                float(energies[mode][rank - 1].item())
+                for mode, rank in zip(local_modes, candidate)
+            ]
+            per_head_retained.append(retained)
+            flat_retained.extend(retained)
+        return per_head_retained, flat_retained
+
+    def candidate_key(candidate):
+        _, flat_retained = retained_for(candidate)
+        return (
+            math.prod(candidate) * fixed_product,
+            -min(flat_retained),
+            -sum(flat_retained) / len(flat_retained),
+            _rank_imbalance(dims, list(candidate)),
+        )
+
+    selected = min(candidates, key=candidate_key)
+    per_head_retained, _ = retained_for(selected)
+    retained_by_mode_min = [
+        min(head_retained[mode_idx] for head_retained in per_head_retained)
+        for mode_idx in range(len(local_modes))
+    ]
+    return list(selected), retained_by_mode_min, per_head_retained
+
+
+def build_headwise_tucker_projection_from_tensor(
+    tensor: torch.Tensor,
+    factor_dims: list[int],
+    modes: list[int],
+    threshold: float,
+    num_heads: int,
+    manual_ranks=None,
+    log_reconstruction_error: bool = False,
+) -> dict:
+    """
+    Build a Tucker projection with independent factors for each attention head.
+
+    This path assumes factor_dims[0] is the head mode and that the head mode is
+    preserved. Ranks are chosen as the smallest common per-head rank tuple that
+    reaches the requested energy threshold for every head, mirroring
+    EigenAttention's max-rank-across-heads behavior.
+    """
+    if not factor_dims or int(factor_dims[0]) != int(num_heads):
+        raise ValueError(
+            f"Headwise Tucker requires factor_dims[0] == num_heads, got "
+            f"factor_dims={factor_dims}, num_heads={num_heads}"
+        )
+    if 1 in modes:
+        raise ValueError("Headwise Tucker expects the OPT head mode to be preserved, but mode 1 was requested")
+
+    prepared = prepare_feature_tensor(tensor, factor_dims).to(torch.float32)
+    head_feature_modes = list(range(2, len(factor_dims) + 1))
+    local_feature_modes = list(range(1, len(factor_dims)))
+    local_modes = [mode - 1 for mode in modes]
+    if any(mode not in local_feature_modes for mode in local_modes):
+        raise ValueError(
+            f"Invalid headwise Tucker modes={modes} for factor_dims={factor_dims}; "
+            f"expected feature modes from {head_feature_modes}"
+        )
+
+    dims = [int(prepared.shape[mode]) for mode in modes]
+    undecomposed_modes = [mode for mode in head_feature_modes if mode not in modes]
+    fixed_product = math.prod(int(prepared.shape[mode]) for mode in undecomposed_modes)
+    energies_by_head = _headwise_mode_cumulative_energies(prepared, local_modes)
+    ranks, retained, head_retained = _select_headwise_mode_ranks_from_energies(
+        energies_by_head,
+        local_modes,
+        dims,
+        threshold,
+        manual_ranks=manual_ranks,
+        fixed_product=fixed_product,
+    )
+
+    head_factors = []
+    head_projection_factors = []
+    for head_idx in range(num_heads):
+        head_tensor = prepared[:, head_idx, ...]
+        factors = _partial_tucker_factors(head_tensor, ranks, local_modes)
+        factor_by_local_mode = {
+            mode: factor
+            for mode, factor in zip(local_modes, factors)
+        }
+        head_factors.append(factors)
+
+        projection_factors = []
+        for local_mode in local_feature_modes:
+            if local_mode in factor_by_local_mode:
+                projection_factors.append(factor_by_local_mode[local_mode])
+            else:
+                dim = int(head_tensor.shape[local_mode])
+                projection_factors.append(torch.eye(dim, dtype=prepared.dtype, device=prepared.device))
+        head_projection_factors.append(projection_factors)
+
+    projection = materialize_headwise_tucker_projection(head_projection_factors)
+    reconstruction_error = None
+    if log_reconstruction_error:
+        reconstruction_error = _headwise_tucker_reconstruction_error_from_factors(
+            prepared,
+            head_factors,
+            local_modes,
+        )
+
+    latent_dim = int(projection.shape[1])
+    per_head_latent_dim = latent_dim // int(num_heads)
+    return {
+        "projection": projection,
+        "factors": head_factors,
+        "projection_factors": head_projection_factors,
+        "ranks": ranks,
+        "latent_dim": latent_dim,
+        "per_head_latent_dim": per_head_latent_dim,
+        "retained_energies": retained,
+        "head_retained_energies": head_retained,
+        "min_retained_energy": min(retained),
+        "mean_retained_energy": sum(sum(x) for x in head_retained) / sum(len(x) for x in head_retained),
+        "reconstruction_error": reconstruction_error,
+        "prepared_shape": tuple(prepared.shape),
+        "modes": modes,
+        "local_modes": local_modes,
+        "factor_dims": factor_dims,
+        "headwise": True,
+        "num_heads": int(num_heads),
+    }
 
 
 def build_tucker_projection_from_tensor(
@@ -850,6 +1071,7 @@ def build_tucker_projection_from_tensor(
         "prepared_shape": tuple(prepared.shape),
         "modes": modes,
         "factor_dims": factor_dims,
+        "headwise": False,
     }
 
 
@@ -878,7 +1100,18 @@ def build_opt_tucker_projection_config(
     flat_v = tensor_v.reshape(-1, hidden_dim)
     flat_kq = torch.cat([flat_k, flat_q], dim=0)
 
-    qk = build_tucker_projection_from_tensor(
+    use_headwise = (
+        cfg.get("preserve_heads", True)
+        and cfg["factor_dims"][0] == int(num_heads)
+        and 1 not in cfg["modes"]
+    )
+    projection_builder = (
+        build_headwise_tucker_projection_from_tensor
+        if use_headwise
+        else build_tucker_projection_from_tensor
+    )
+
+    qk = projection_builder(
         flat_kq,
         cfg["factor_dims"],
         cfg["modes"],
@@ -887,7 +1120,7 @@ def build_opt_tucker_projection_config(
         manual_ranks=cfg["manual_ranks_kq"],
         log_reconstruction_error=cfg["log_reconstruction_error"],
     )
-    v = build_tucker_projection_from_tensor(
+    v = projection_builder(
         flat_v,
         cfg["factor_dims"],
         cfg["modes"],
@@ -901,6 +1134,7 @@ def build_opt_tucker_projection_config(
         "threshold": float(threshold),
         "factor_dims": cfg["factor_dims"],
         "modes": cfg["modes"],
+        "headwise": use_headwise,
         "qk": qk,
         "v": v,
     }
