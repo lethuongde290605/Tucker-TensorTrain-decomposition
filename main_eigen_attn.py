@@ -417,9 +417,14 @@ def main():
             low_rank_config[i][1] = layers[i].self_attn.rank_v
 
         config = AutoConfig.from_pretrained(args.model, attn_implementation=args.attn_implementation, cache_dir = args.cache_dir)
-        from models.modelling_opt_eigen_attn import OPTForCausalLM_EigenAttn
+        if args.use_tucker_attn:
+            from models.modelling_opt_tucker_attn import OPTForCausalLM_TuckerAttn
 
-        model2 = OPTForCausalLM_EigenAttn.from_pretrained(args.model, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+            model2 = OPTForCausalLM_TuckerAttn.from_pretrained(args.model, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+        else:
+            from models.modelling_opt_eigen_attn import OPTForCausalLM_EigenAttn
+
+            model2 = OPTForCausalLM_EigenAttn.from_pretrained(args.model, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
         layers2 = model2.model.decoder.layers
         for i in range(len(layers2)):
             layers2[i].self_attn.k_proj_low.weight.data = layers[i].self_attn.k_proj.weight.data
@@ -441,6 +446,7 @@ def main():
             lm.model.save_pretrained(args.save_dir)  
             lm.tokenizer.save_pretrained(args.save_dir) 
             torch.save(low_rank_config, os.path.join(args.save_dir,'low_rank_config.pt'))
+            torch.save("tucker" if args.use_tucker_attn else "eigen", os.path.join(args.save_dir,'low_rank_type.pt'))
         
     
     elif 'mpt' in args.net.lower():

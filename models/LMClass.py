@@ -8,6 +8,7 @@ import torch
 from tqdm import tqdm
 import pdb
 from models.modelling_opt_eigen_attn import OPTForCausalLM_EigenAttn
+from models.modelling_opt_tucker_attn import OPTForCausalLM_TuckerAttn
 from models.modelling_mpt_eigen_attn import MptForCausalLM_EigenAttn
 from models.modelling_llama_eigen_attn import LlamaForCausalLM_EigenAttn
 import os
@@ -52,7 +53,16 @@ class LMClass(BaseLM):
                     self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
                     
             elif 'opt' in args.net.lower():
-                self.model = OPTForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+                low_rank_type_path = os.path.join(args.save_dir, 'low_rank_type.pt')
+                if os.path.exists(low_rank_type_path):
+                    low_rank_type = torch.load(low_rank_type_path)
+                else:
+                    low_rank_type = "tucker" if getattr(args, "use_tucker_attn", False) else "eigen"
+
+                if low_rank_type == "tucker":
+                    self.model = OPTForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+                else:
+                    self.model = OPTForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
                 if args.load_peft_model:
                     self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
 

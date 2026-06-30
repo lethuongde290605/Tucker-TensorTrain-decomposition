@@ -571,9 +571,18 @@ class HFLM(TemplateLM):
                     self._model.model.norm.to(output_device)
                     self._model.lm_head.to(output_device)
                 elif 'opt' in pretrained:
-                    from models.modelling_opt_eigen_attn import OPTForCausalLM_EigenAttn
                     from parallel_utils import map_layers_to_multi_gpus
-                    self._model = OPTForCausalLM_EigenAttn.from_pretrained(pretrained, low_rank_config=low_rank_config, device_map='cpu',torch_dtype=torch.float16)
+                    low_rank_type_path = os.path.join(pretrained, 'low_rank_type.pt')
+                    if os.path.exists(low_rank_type_path):
+                        low_rank_type = torch.load(low_rank_type_path)
+                    else:
+                        low_rank_type = "eigen"
+                    if low_rank_type == "tucker":
+                        from models.modelling_opt_tucker_attn import OPTForCausalLM_TuckerAttn
+                        self._model = OPTForCausalLM_TuckerAttn.from_pretrained(pretrained, low_rank_config=low_rank_config, device_map='cpu',torch_dtype=torch.float16)
+                    else:
+                        from models.modelling_opt_eigen_attn import OPTForCausalLM_EigenAttn
+                        self._model = OPTForCausalLM_EigenAttn.from_pretrained(pretrained, low_rank_config=low_rank_config, device_map='cpu',torch_dtype=torch.float16)
                     map_layers_to_multi_gpus(self._model.model.decoder.layers)
                     input_device = self._model.model.decoder.layers[0].device
                     output_device = self._model.model.decoder.layers[-1].device
