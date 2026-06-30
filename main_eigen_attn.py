@@ -420,10 +420,12 @@ def main():
         if args.use_tucker_attn:
             from models.modelling_opt_tucker_attn import OPTForCausalLM_TuckerAttn
 
+            logger.info("Building OPTForCausalLM_TuckerAttn for Tucker-compressed OPT")
             model2 = OPTForCausalLM_TuckerAttn.from_pretrained(args.model, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
         else:
             from models.modelling_opt_eigen_attn import OPTForCausalLM_EigenAttn
 
+            logger.info("Building OPTForCausalLM_EigenAttn for EigenAttn-compressed OPT")
             model2 = OPTForCausalLM_EigenAttn.from_pretrained(args.model, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
         layers2 = model2.model.decoder.layers
         for i in range(len(layers2)):

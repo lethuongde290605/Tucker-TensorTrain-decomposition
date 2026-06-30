@@ -366,11 +366,15 @@ def eigenattn(
                     del output_hr
                     torch.cuda.empty_cache()
 
+                    # For Tucker, propagate compressed activations so the next
+                    # layer is calibrated on the distribution it will see at eval.
+                    propagation_layer = qlayer if _use_opt_tucker_attention(args) else layer
+
                     # obtain output of model for propagation to next layer
                     with torch.no_grad():
                         with torch.cuda.amp.autocast():
                             for j in range(args.nsamples):
-                                inps[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                                inps[j] = propagation_layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
 
         elif is_mpt:
             with torch.no_grad():
