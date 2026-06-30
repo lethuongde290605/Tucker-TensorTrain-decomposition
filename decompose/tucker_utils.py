@@ -748,6 +748,48 @@ def _tucker_reconstruction_error_from_factors(
     return float((torch.linalg.norm(tensor.to(torch.float32) - reconstructed) / denom).item())
 
 
+def _partial_tucker_factors(
+    tensor: torch.Tensor,
+    ranks: list[int],
+    modes: list[int],
+    n_iter_max: int = 200,
+) -> list[torch.Tensor]:
+    """
+    Compute Tucker factors with TensorLy after ranks have been selected.
+
+    Rank selection still uses per-mode SVD energy. This helper then runs
+    Partial Tucker/HOOI so the factors are optimized jointly across modes.
+    """
+    tensor_f32 = tensor.to(torch.float32)
+    original_device = tensor_f32.device
+
+    def _run_partial_tucker(input_tensor):
+        result = partial_tucker(
+            input_tensor,
+            rank=ranks,
+            modes=modes,
+            n_iter_max=n_iter_max,
+            verbose=False,
+        )
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], (tuple, list)):
+            (_, factors), _ = result
+        else:
+            _, factors = result
+        return factors
+
+    try:
+        if tensor_f32.is_cuda:
+            with torch.amp.autocast('cuda', enabled=False):
+                factors = _run_partial_tucker(tensor_f32)
+        else:
+            factors = _run_partial_tucker(tensor_f32)
+    except RuntimeError:
+        factors = _run_partial_tucker(tensor_f32.cpu())
+        factors = [factor.to(original_device) for factor in factors]
+
+    return [factor.contiguous() for factor in factors]
+
+
 def build_tucker_projection_from_tensor(
     tensor: torch.Tensor,
     factor_dims: list[int],
@@ -776,13 +818,9 @@ def build_tucker_projection_from_tensor(
         fixed_product=fixed_product,
     )
 
-    factors = []
+    factors = _partial_tucker_factors(prepared, ranks, modes)
     factor_by_mode = {}
-    for mode, rank in zip(modes, ranks):
-        matrix = unfold_tensor(prepared, mode)
-        u, _, _ = torch.linalg.svd(matrix, full_matrices=False)
-        factor = u[:, :rank].contiguous()
-        factors.append(factor)
+    for mode, factor in zip(modes, factors):
         factor_by_mode[mode] = factor
 
     projection_factors = []
