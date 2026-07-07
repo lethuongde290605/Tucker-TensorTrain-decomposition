@@ -322,12 +322,21 @@ def main():
     parser.add_argument("--tucker_threshold_step", type=float, default=0.02)
     parser.add_argument("--tucker_min_threshold", type=float, default=0.30)
     parser.add_argument("--tucker_no_preserve_heads", action="store_true", help="allow Tucker decomposition on the OPT head mode")
+    parser.add_argument(
+        "--tucker_compress_opt_head_mode",
+        action="store_true",
+        help="experimental OPT-125M Tucker path: reshape hidden dim as 12 8 8 and compress the head mode too",
+    )
     parser.add_argument("--tucker_log_reconstruction_error", action="store_true", help="log Tucker tensor reconstruction error for debugging only")
 
 
     args = parser.parse_args()
     if args.load_in_4bit and args.load_in_8bit:
         raise ValueError("Choose only one of --load_in_4bit or --load_in_8bit")
+    if args.tucker_compress_opt_head_mode:
+        args.use_tucker_attn = True
+        if args.tucker_factor_dims is None:
+            args.tucker_factor_dims = [12, 8, 8]
     model_name_for_guard = args.net or args.model
     quantized_decompose_supported = "llama" in model_name_for_guard.lower() and args.use_tucker_attn
     if (args.load_in_4bit or args.load_in_8bit) and not (
@@ -348,6 +357,8 @@ def main():
 
     if args.net is None:
         args.net = args.model.split('/')[-1]
+    if args.tucker_compress_opt_head_mode and "opt-125m" not in args.net.lower():
+        raise ValueError("--tucker_compress_opt_head_mode is intended for OPT-125M only")
 
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -422,7 +433,7 @@ def main():
                 "initial_threshold": args.tucker_initial_threshold,
                 "threshold_step": args.tucker_threshold_step,
                 "min_threshold": args.tucker_min_threshold,
-                "preserve_heads": not args.tucker_no_preserve_heads,
+                "preserve_heads": not (args.tucker_no_preserve_heads or args.tucker_compress_opt_head_mode),
                 "log_reconstruction_error": args.tucker_log_reconstruction_error,
             },
         }
