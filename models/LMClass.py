@@ -12,6 +12,7 @@ from models.modelling_mpt_eigen_attn import MptForCausalLM_EigenAttn
 from models.modelling_llama_eigen_attn import LlamaForCausalLM_EigenAttn
 from models.modelling_llama_tucker_attn import LlamaForCausalLM_TuckerAttn
 import os
+import json
 from contextlib import contextmanager
 from typing import List, Optional, Tuple, Union
 from lm_eval.models.utils import (
@@ -70,6 +71,95 @@ def _model_load_kwargs(args):
         "torch_dtype": torch.float16,
         "cache_dir": args.cache_dir,
     }
+
+
+def _module_device(module, fallback):
+    for param in module.parameters(recurse=True):
+        return param.device
+    for buffer in module.buffers(recurse=True):
+        return buffer.device
+    return torch.device(fallback)
+
+
+def _load_tucker_attention_state(save_dir):
+    state = {}
+
+    safetensors_index = os.path.join(save_dir, "model.safetensors.index.json")
+    bin_index = os.path.join(save_dir, "pytorch_model.bin.index.json")
+    safetensors_file = os.path.join(save_dir, "model.safetensors")
+    bin_file = os.path.join(save_dir, "pytorch_model.bin")
+
+    if os.path.exists(safetensors_index):
+        from safetensors import safe_open
+
+        with open(safetensors_index, "r", encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+        shard_to_keys = {}
+        for key, shard in weight_map.items():
+            if ".self_attn." in key:
+                shard_to_keys.setdefault(shard, []).append(key)
+        for shard, keys in shard_to_keys.items():
+            with safe_open(os.path.join(save_dir, shard), framework="pt", device="cpu") as f:
+                for key in keys:
+                    state[key] = f.get_tensor(key)
+        return state
+
+    if os.path.exists(safetensors_file):
+        from safetensors import safe_open
+
+        with safe_open(safetensors_file, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if ".self_attn." in key:
+                    state[key] = f.get_tensor(key)
+        return state
+
+    if os.path.exists(bin_index):
+        with open(bin_index, "r", encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+        shards = sorted({shard for key, shard in weight_map.items() if ".self_attn." in key})
+        for shard in shards:
+            shard_state = torch.load(os.path.join(save_dir, shard), map_location="cpu")
+            for key, value in shard_state.items():
+                if ".self_attn." in key:
+                    state[key] = value
+        return state
+
+    if os.path.exists(bin_file):
+        full_state = torch.load(bin_file, map_location="cpu")
+        return {key: value for key, value in full_state.items() if ".self_attn." in key}
+
+    raise FileNotFoundError(f"Could not find model weights in {save_dir}")
+
+
+def _attach_llama_tucker_attention_to_quantized_base(model, config, low_rank_config, save_dir, device):
+    from models.modelling_llama_tucker_attn import LlamaTuckerAttention
+
+    attention_state = _load_tucker_attention_state(save_dir)
+    for layer_idx, layer in enumerate(model.model.layers):
+        rank_kq, rank_v = low_rank_config[layer_idx]
+        tucker_attn = LlamaTuckerAttention(
+            rank_kq=int(rank_kq),
+            rank_v=int(rank_v),
+            config=config,
+            layer_idx=layer_idx,
+        )
+        prefix = f"model.layers.{layer_idx}.self_attn."
+        layer_attention_state = {
+            key[len(prefix):]: value
+            for key, value in attention_state.items()
+            if key.startswith(prefix)
+        }
+        missing, unexpected = tucker_attn.load_state_dict(layer_attention_state, strict=False)
+        missing = [key for key in missing if not key.startswith("rotary_emb.")]
+        unexpected = [key for key in unexpected if not key.startswith("rotary_emb.")]
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Unexpected Tucker attention state for layer {layer_idx}: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        layer_device = _module_device(layer, device)
+        layer.self_attn = tucker_attn.to(device=layer_device, dtype=torch.float16)
+    return model
 
 
 @contextmanager
@@ -158,7 +248,17 @@ class LMClass(BaseLM):
                         low_rank_type = "tucker" if getattr(args, "use_tucker_attn", False) else "eigen"
 
                     if low_rank_type == "tucker":
-                        self.model = LlamaForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
+                        if self.is_quantized:
+                            self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, **model_load_kwargs)
+                            self.model = _attach_llama_tucker_attention_to_quantized_base(
+                                self.model,
+                                config,
+                                low_rank_config,
+                                args.save_dir,
+                                self._device,
+                            )
+                        else:
+                            self.model = LlamaForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
                     else:
                         self.model = LlamaForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
                     if args.load_peft_model:
