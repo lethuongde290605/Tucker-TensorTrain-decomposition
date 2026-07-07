@@ -139,6 +139,11 @@ class _TemporaryDequantizedLlamaAttention:
         return False
 
 
+def _move_llama_tucker_attention_to_device(qlayer, device):
+    qlayer.self_attn = qlayer.self_attn.to(device)
+    return qlayer
+
+
 def _log_tucker_candidate(logger, layer_id, tucker_config, output_error, compression_ratio, memory_mb):
     qk = tucker_config["qk"]
     v = tucker_config["v"]
@@ -585,6 +590,8 @@ def eigenattn(
                             )
                             if not is_quantized:
                                 qlayer_candidate = qlayer_candidate.to(dev)
+                            else:
+                                qlayer_candidate = _move_llama_tucker_attention_to_device(qlayer_candidate, layer_device)
                             output_lr = torch.stack([
                                 qlayer_candidate(
                                     inps[j].unsqueeze(0),
@@ -663,6 +670,8 @@ def eigenattn(
                                 qlayer = LlamaTuckerAttnDecoderLayer(layer, args, best_config, lm.model.config, i)
                                 if not is_quantized:
                                     qlayer = qlayer.to(dev)
+                                else:
+                                    qlayer = _move_llama_tucker_attention_to_device(qlayer, layer_device)
                             else:
                                 logger.info(
                                     f"layer {i} full LLaMA Tucker output_error:{error} still exceeds "
@@ -677,6 +686,8 @@ def eigenattn(
                             qlayer = LlamaTuckerAttnDecoderLayer(layer, args, best_config, lm.model.config, i)
                             if not is_quantized:
                                 qlayer = qlayer.to(dev)
+                            else:
+                                qlayer = _move_llama_tucker_attention_to_device(qlayer, layer_device)
                             error = best_error
 
                         if best_config is not None:
