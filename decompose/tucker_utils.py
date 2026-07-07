@@ -768,9 +768,19 @@ def materialize_tucker_projection(factors: list[torch.Tensor]) -> torch.Tensor:
     if not factors:
         raise ValueError("Cannot materialize Tucker projection from an empty factor list")
 
+    def _safe_kron(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        left = left.reshape(left.shape[0], left.shape[1])
+        right = right.reshape(right.shape[0], right.shape[1])
+        return (
+            left[:, None, :, None]
+            .mul(right[None, :, None, :])
+            .reshape(left.shape[0] * right.shape[0], left.shape[1] * right.shape[1])
+            .contiguous()
+        )
+
     projection = factors[0].contiguous()
     for factor in factors[1:]:
-        projection = torch.kron(projection.contiguous(), factor.contiguous())
+        projection = _safe_kron(projection, factor.contiguous())
     return projection.contiguous()
 
 
