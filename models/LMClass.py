@@ -12,6 +12,7 @@ from models.modelling_mpt_eigen_attn import MptForCausalLM_EigenAttn
 from models.modelling_llama_eigen_attn import LlamaForCausalLM_EigenAttn
 from models.modelling_llama_tucker_attn import LlamaForCausalLM_TuckerAttn
 import os
+from contextlib import contextmanager
 from typing import List, Optional, Tuple, Union
 from lm_eval.models.utils import (
     Collator,
@@ -71,6 +72,38 @@ def _model_load_kwargs(args):
     }
 
 
+@contextmanager
+def _force_accelerate_hooks_for_quantized_load(enabled):
+    if not enabled:
+        yield
+        return
+
+    try:
+        import accelerate.big_modeling as accelerate_big_modeling
+        import transformers.modeling_utils as transformers_modeling_utils
+    except Exception:
+        yield
+        return
+
+    original_accelerate_dispatch = accelerate_big_modeling.dispatch_model
+    original_transformers_dispatch = getattr(transformers_modeling_utils, "dispatch_model", None)
+
+    def dispatch_model_with_forced_hooks(model, *args, **kwargs):
+        kwargs["force_hooks"] = True
+        return original_accelerate_dispatch(model, *args, **kwargs)
+
+    accelerate_big_modeling.dispatch_model = dispatch_model_with_forced_hooks
+    if original_transformers_dispatch is not None:
+        transformers_modeling_utils.dispatch_model = dispatch_model_with_forced_hooks
+
+    try:
+        yield
+    finally:
+        accelerate_big_modeling.dispatch_model = original_accelerate_dispatch
+        if original_transformers_dispatch is not None:
+            transformers_modeling_utils.dispatch_model = original_transformers_dispatch
+
+
 class LMClass(BaseLM):
     def __init__(self, args):
 
@@ -95,45 +128,46 @@ class LMClass(BaseLM):
         
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=use_fast,legacy=False, cache_dir = args.cache_dir)
         model_load_kwargs = _model_load_kwargs(args)
-        if args.load_low_rank :
-            low_rank_config = torch.load(os.path.join(args.save_dir,'low_rank_config.pt'))
-            if 'mpt' in args.net.lower():
-                self.model = MptForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
-                if args.load_peft_model:
-                    self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
-                    
-            elif 'opt' in args.net.lower():
-                low_rank_type_path = os.path.join(args.save_dir, 'low_rank_type.pt')
-                if os.path.exists(low_rank_type_path):
-                    low_rank_type = torch.load(low_rank_type_path)
-                else:
-                    low_rank_type = "tucker" if getattr(args, "use_tucker_attn", False) else "eigen"
+        with _force_accelerate_hooks_for_quantized_load(self.is_quantized):
+            if args.load_low_rank :
+                low_rank_config = torch.load(os.path.join(args.save_dir,'low_rank_config.pt'))
+                if 'mpt' in args.net.lower():
+                    self.model = MptForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
+                    if args.load_peft_model:
+                        self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
+                        
+                elif 'opt' in args.net.lower():
+                    low_rank_type_path = os.path.join(args.save_dir, 'low_rank_type.pt')
+                    if os.path.exists(low_rank_type_path):
+                        low_rank_type = torch.load(low_rank_type_path)
+                    else:
+                        low_rank_type = "tucker" if getattr(args, "use_tucker_attn", False) else "eigen"
 
-                if low_rank_type == "tucker":
-                    self.model = OPTForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, **model_load_kwargs)
-                else:
-                    self.model = OPTForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, **model_load_kwargs)
-                if args.load_peft_model:
-                    self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
+                    if low_rank_type == "tucker":
+                        self.model = OPTForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, **model_load_kwargs)
+                    else:
+                        self.model = OPTForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, **model_load_kwargs)
+                    if args.load_peft_model:
+                        self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
 
-            elif 'llama' in args.net.lower():
-                low_rank_type_path = os.path.join(args.save_dir, 'low_rank_type.pt')
-                if os.path.exists(low_rank_type_path):
-                    low_rank_type = torch.load(low_rank_type_path)
-                else:
-                    low_rank_type = "tucker" if getattr(args, "use_tucker_attn", False) else "eigen"
+                elif 'llama' in args.net.lower():
+                    low_rank_type_path = os.path.join(args.save_dir, 'low_rank_type.pt')
+                    if os.path.exists(low_rank_type_path):
+                        low_rank_type = torch.load(low_rank_type_path)
+                    else:
+                        low_rank_type = "tucker" if getattr(args, "use_tucker_attn", False) else "eigen"
 
-                if low_rank_type == "tucker":
-                    self.model = LlamaForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
+                    if low_rank_type == "tucker":
+                        self.model = LlamaForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
+                    else:
+                        self.model = LlamaForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
+                    if args.load_peft_model:
+                        self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
+                        self.model = self.model.model
                 else:
-                    self.model = LlamaForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
-                if args.load_peft_model:
-                    self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
-                    self.model = self.model.model
+                    raise NotImplementedError
             else:
-                raise NotImplementedError
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, **model_load_kwargs)
+                self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, **model_load_kwargs)
         if 'mpt' in args.net.lower():
             self.seqlen = self.model.config.max_seq_len
         else:
