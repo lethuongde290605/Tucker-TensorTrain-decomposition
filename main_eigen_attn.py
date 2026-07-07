@@ -479,7 +479,7 @@ def main():
             torch.save("tucker" if args.use_tucker_attn else "eigen", os.path.join(args.save_dir,'low_rank_type.pt'))
         
     
-    elif 'mpt' in args.net.lower():
+    elif (not args.load_low_rank) and 'mpt' in args.net.lower():
             layers = lm.model.transformer.blocks
             low_rank_config = torch.zeros(len(layers), 2)
             for i in range(len(layers)):
@@ -504,7 +504,7 @@ def main():
                 lm.tokenizer.save_pretrained(args.save_dir) 
                 torch.save(low_rank_config, os.path.join(args.save_dir,'low_rank_config.pt'))
     
-    elif 'llama' in args.net.lower():
+    elif (not args.load_low_rank) and 'llama' in args.net.lower():
             layers = lm.model.model.layers
             low_rank_config = []
             for i in range(len(layers)):
