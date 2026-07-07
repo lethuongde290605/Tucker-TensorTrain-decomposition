@@ -58,27 +58,53 @@ def _module_device(module, fallback):
     return torch.device(fallback)
 
 
-def _dequantize_weight(weight):
+def _reshape_dequantized_weight(weight, expected_shape):
+    if tuple(weight.shape) == tuple(expected_shape):
+        return weight
+    if weight.numel() == expected_shape[0] * expected_shape[1]:
+        return weight.reshape(expected_shape)
+    raise RuntimeError(
+        f"Cannot dequantize linear weight to expected shape {expected_shape}; "
+        f"got tensor shape {tuple(weight.shape)} with {weight.numel()} elements"
+    )
+
+
+def _dequantize_weight(module):
+    weight = module.weight
+    expected_shape = (module.out_features, module.in_features)
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is not None:
+        try:
+            import bitsandbytes as bnb
+
+            dequantized = bnb.functional.dequantize_4bit(weight.data, quant_state)
+            return _reshape_dequantized_weight(dequantized, expected_shape)
+        except Exception:
+            pass
+
     if hasattr(weight, "dequantize"):
         try:
-            return weight.dequantize()
+            dequantized = weight.dequantize()
+            return _reshape_dequantized_weight(dequantized, expected_shape)
         except Exception:
             pass
     data = getattr(weight, "data", weight)
     if hasattr(data, "dequantize"):
         try:
-            return data.dequantize()
+            dequantized = data.dequantize()
+            return _reshape_dequantized_weight(dequantized, expected_shape)
         except Exception:
             pass
-    return weight.detach()
+
+    return _reshape_dequantized_weight(weight.detach(), expected_shape)
 
 
 def _clone_as_fp_linear(module, device, dtype=torch.float16):
-    weight = _dequantize_weight(module.weight).to(device=device, dtype=dtype).contiguous()
+    weight = _dequantize_weight(module).to(device=device, dtype=dtype).contiguous()
     bias = getattr(module, "bias", None)
     linear = nn.Linear(
-        weight.shape[1],
-        weight.shape[0],
+        module.in_features,
+        module.out_features,
         bias=bias is not None,
         device=device,
         dtype=dtype,
