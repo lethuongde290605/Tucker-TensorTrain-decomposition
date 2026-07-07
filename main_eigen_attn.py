@@ -111,27 +111,32 @@ def get_kvcache_size_llama(lm):
 @torch.no_grad()
 def evaluate(lm, args, logger):
     results = {}
+    is_quantized = bool(getattr(args, "load_in_4bit", False) or getattr(args, "load_in_8bit", False))
     if args.multigpu:
+        if is_quantized:
+            logger.info("Skipping manual multi-GPU layer mapping because quantized model uses device_map")
         if "opt" in args.net.lower():
-            map_layers_to_multi_gpus(lm.model.model.decoder.layers)
-            input_device = lm.model.model.decoder.layers[0].device
-            output_device = lm.model.model.decoder.layers[-1].device
-            lm._device = input_device
-            assert input_device == output_device
-            lm.model.model.decoder.embed_positions.to(input_device)
-            lm.model.model.decoder.embed_tokens.to(input_device)
-            lm.model.model.decoder.final_layer_norm.to(output_device)
-            lm.model.lm_head.to(output_device)
+            if not is_quantized:
+                map_layers_to_multi_gpus(lm.model.model.decoder.layers)
+                input_device = lm.model.model.decoder.layers[0].device
+                output_device = lm.model.model.decoder.layers[-1].device
+                lm._device = input_device
+                assert input_device == output_device
+                lm.model.model.decoder.embed_positions.to(input_device)
+                lm.model.model.decoder.embed_tokens.to(input_device)
+                lm.model.model.decoder.final_layer_norm.to(output_device)
+                lm.model.lm_head.to(output_device)
 
         elif "llama" in args.net.lower() or "mistral" in args.net.lower() or "qwen2" in args.net.lower():
-            map_layers_to_multi_gpus(lm.model.model.layers)
-            input_device = lm.model.model.layers[0].device
-            output_device = lm.model.model.layers[-1].device
-            assert input_device == output_device
-            lm._device = input_device
-            lm.model.model.embed_tokens.to(input_device)
-            lm.model.model.norm.to(output_device)
-            lm.model.lm_head.to(output_device)
+            if not is_quantized:
+                map_layers_to_multi_gpus(lm.model.model.layers)
+                input_device = lm.model.model.layers[0].device
+                output_device = lm.model.model.layers[-1].device
+                assert input_device == output_device
+                lm._device = input_device
+                lm.model.model.embed_tokens.to(input_device)
+                lm.model.model.norm.to(output_device)
+                lm.model.lm_head.to(output_device)
         elif "falcon" in args.net.lower():
             map_layers_to_multi_gpus(lm.model.transformer.h)
             input_device = lm.model.transformer.h[0].device
@@ -142,24 +147,28 @@ def evaluate(lm, args, logger):
             lm.model.transformer.ln_f.to(output_device)
             lm.model.lm_head.to(output_device)
         elif 'mpt' in args.net.lower():
-            map_layers_to_multi_gpus(lm.model.transformer.blocks)
+            if not is_quantized:
+                map_layers_to_multi_gpus(lm.model.transformer.blocks)
 
-            input_device = lm.model.transformer.blocks[0].device
-            output_device = lm.model.transformer.blocks[-1].device
-            assert input_device == output_device
-            lm._device = input_device
-            lm.model.transformer.wte.to(input_device)
-            lm.model.transformer.norm_f.to(output_device)
-            lm.model.lm_head.to(output_device)
+                input_device = lm.model.transformer.blocks[0].device
+                output_device = lm.model.transformer.blocks[-1].device
+                assert input_device == output_device
+                lm._device = input_device
+                lm.model.transformer.wte.to(input_device)
+                lm.model.transformer.norm_f.to(output_device)
+                lm.model.lm_head.to(output_device)
 
 
     else:
-        if "opt" in args.net.lower():
-            lm.model.model.decoder = lm.model.model.decoder.to(lm.device)
-        elif "llama" in args.net.lower() or "mistral" in args.net.lower() or "qwen2" in args.net.lower():
-            lm.model = lm.model.to(lm.device)
-        elif "mpt" in args.net.lower():
-            lm.model.transformer = lm.model.transformer.to(lm.device)
+        if is_quantized:
+            logger.info("Skipping manual model.to(device) because quantized model uses device_map")
+        else:
+            if "opt" in args.net.lower():
+                lm.model.model.decoder = lm.model.model.decoder.to(lm.device)
+            elif "llama" in args.net.lower() or "mistral" in args.net.lower() or "qwen2" in args.net.lower():
+                lm.model = lm.model.to(lm.device)
+            elif "mpt" in args.net.lower():
+                lm.model.transformer = lm.model.transformer.to(lm.device)
 
 
     if args.eval_ppl:
@@ -298,10 +307,16 @@ def main():
     parser.add_argument("--save_dir",  default=None, help="path to save the compressed and finetuned model")
     parser.add_argument("--output_dir",  default=None, help="path to save the log file")
     parser.add_argument("--evaluate_baseline",  action="store_true")
+    parser.add_argument("--load_in_4bit", action="store_true", help="load model with bitsandbytes 4-bit quantization for eval/load_low_rank")
+    parser.add_argument("--load_in_8bit", action="store_true", help="load model with bitsandbytes 8-bit quantization for eval/load_low_rank")
+    parser.add_argument("--bnb_4bit_quant_type", type=str, default="nf4", choices=["nf4", "fp4"])
+    parser.add_argument("--bnb_4bit_compute_dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--bnb_4bit_use_double_quant", action="store_true")
+    parser.add_argument("--quant_device_map", type=str, default="auto", help="device_map used for bitsandbytes quantized loading")
     parser.add_argument("--avg_dim", type = int)
     parser.add_argument("--error_budget", type = float, default = 0.025)
     parser.add_argument("--fine_tune", action="store_true", help="if you want to finetune model after compressing")
-    parser.add_argument("--use_tucker_attn", action="store_true", help="use Tucker-only attention instead of EigenAttention for OPT")
+    parser.add_argument("--use_tucker_attn", action="store_true", help="use Tucker-only attention instead of EigenAttention for supported models")
     parser.add_argument("--tucker_factor_dims", type=int, nargs="+", default=None, help="feature factorization for Tucker attention, e.g. 12 8 8 for OPT-125M")
     parser.add_argument("--tucker_initial_threshold", type=float, default=0.98)
     parser.add_argument("--tucker_threshold_step", type=float, default=0.02)
@@ -311,6 +326,13 @@ def main():
 
 
     args = parser.parse_args()
+    if args.load_in_4bit and args.load_in_8bit:
+        raise ValueError("Choose only one of --load_in_4bit or --load_in_8bit")
+    if (args.load_in_4bit or args.load_in_8bit) and not (args.load_low_rank or args.evaluate_baseline):
+        raise ValueError(
+            "Quantized loading is currently supported for --evaluate_baseline or --load_low_rank evaluation. "
+            "Run decomposition without quantization, then reload the saved low-rank model with --load_low_rank --load_in_4bit."
+        )
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -409,7 +431,7 @@ def main():
         print("You are already loading a low rank compressed model.")
 
     # now that we have a compressed model. We know the low rank dimensions for Key, Query and Value layers. We will create another model with the known dimensions (not a clean method but works :) )
-    if 'opt' in args.net.lower():
+    if (not args.load_low_rank) and 'opt' in args.net.lower():
         layers = lm.model.model.decoder.layers
         low_rank_config = torch.zeros(len(layers), 2)
         for i in range(len(layers)):
@@ -482,27 +504,38 @@ def main():
             for i in range(len(layers)):
                 low_rank_config.append([int(layers[i].self_attn.rank_kq), int(layers[i].self_attn.rank_v)])
             
-            from models.modelling_llama_eigen_attn import LlamaForCausalLM_EigenAttn
-
             config = AutoConfig.from_pretrained(args.model, attn_implementation=args.attn_implementation, cache_dir = args.cache_dir)
-            model2 = LlamaForCausalLM_EigenAttn.from_pretrained(args.model, config=config, low_rank_config=low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+            if args.use_tucker_attn:
+                from models.modelling_llama_tucker_attn import LlamaForCausalLM_TuckerAttn
+
+                logger.info("Building LlamaForCausalLM_TuckerAttn for Tucker-compressed LLaMA")
+                model2 = LlamaForCausalLM_TuckerAttn.from_pretrained(args.model, config=config, low_rank_config=low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+            else:
+                from models.modelling_llama_eigen_attn import LlamaForCausalLM_EigenAttn
+
+                logger.info("Building LlamaForCausalLM_EigenAttn for EigenAttn-compressed LLaMA")
+                model2 = LlamaForCausalLM_EigenAttn.from_pretrained(args.model, config=config, low_rank_config=low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
             layers2 = model2.model.layers
             bias = config.attention_bias
             for i in range(len(layers2)):
-                #K
+                layers2[i].self_attn.q_proj.weight.data = layers[i].self_attn.q_proj.weight.data
+                if bias:
+                    layers2[i].self_attn.q_proj.bias.data = layers[i].self_attn.q_proj.bias.data
+
                 layers2[i].self_attn.k_proj_low.weight.data = layers[i].self_attn.k_proj_low.weight.data
                 if bias:
                     layers2[i].self_attn.k_proj_low.bias.data = layers[i].self_attn.k_proj_low.bias.data
-                layers2[i].self_attn.k_proj_up.weight.data = layers[i].self_attn.k_proj_up.weight.data
+                if args.use_tucker_attn:
+                    layers2[i].self_attn.k_proj_up_weight.data = layers[i].self_attn.k_proj_up_weight.data
+                else:
+                    layers2[i].self_attn.k_proj_up.weight.data = layers[i].self_attn.k_proj_up.weight.data
 
-                #V
                 layers2[i].self_attn.v_proj_low.weight.data = layers[i].self_attn.v_proj_low.weight.data
                 if bias:
                     layers2[i].self_attn.v_proj_low.bias.data = layers[i].self_attn.v_proj_low.bias.data
 
-                #O
                 layers2[i].self_attn.o_proj_up.weight.data = layers[i].self_attn.o_proj_up.weight.data
-                if bias:
+                if layers2[i].self_attn.o_proj_up.bias is not None:
                     layers2[i].self_attn.o_proj_up.bias.data = layers[i].self_attn.o_proj_up.bias.data
                 
             
@@ -512,6 +545,7 @@ def main():
                 lm.model.save_pretrained(args.save_dir)  
                 lm.tokenizer.save_pretrained(args.save_dir) 
                 torch.save(low_rank_config, os.path.join(args.save_dir,'low_rank_config.pt'))
+                torch.save("tucker" if args.use_tucker_attn else "eigen", os.path.join(args.save_dir,'low_rank_type.pt'))
     
     logger.info(time.time() - tick)
     

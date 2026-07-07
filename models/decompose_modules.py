@@ -1043,6 +1043,260 @@ class LlamaEigenAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
     
 
+class LlamaTuckerAttention(nn.Module):
+    """LLaMA attention with Tucker-compressed K/V projections."""
+
+    def __init__(
+        self,
+        ori_layer,
+        projection_k: torch.Tensor,
+        projection_v: torch.Tensor,
+        config: LlamaConfig,
+        layer_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+
+        kv_dim = self.num_key_value_heads * self.head_dim
+        if projection_k.shape[0] != kv_dim or projection_v.shape[0] != kv_dim:
+            raise ValueError(
+                f"LLaMA Tucker projection rows must equal kv_dim={kv_dim}, "
+                f"got K={tuple(projection_k.shape)} V={tuple(projection_v.shape)}"
+            )
+
+        self.rank_kq = int(projection_k.shape[1])
+        self.rank_v = int(projection_v.shape[1])
+        if self.rank_kq % self.num_key_value_heads != 0:
+            raise ValueError(f"Tucker K rank {self.rank_kq} must be divisible by num_key_value_heads={self.num_key_value_heads}")
+        if self.rank_v % self.num_key_value_heads != 0:
+            raise ValueError(f"Tucker V rank {self.rank_v} must be divisible by num_key_value_heads={self.num_key_value_heads}")
+
+        k_per_head = self.rank_kq // self.num_key_value_heads
+        v_per_head = self.rank_v // self.num_key_value_heads
+        bias = config.attention_bias
+
+        org_weight_k = ori_layer.k_proj.weight
+        org_bias_k = ori_layer.k_proj.bias
+        org_weight_v = ori_layer.v_proj.weight
+        org_bias_v = ori_layer.v_proj.bias
+        org_weight_out = ori_layer.o_proj.weight
+        org_bias_out = ori_layer.o_proj.bias
+
+        projection_k = projection_k.to(device=org_weight_k.device, dtype=org_weight_k.dtype)
+        projection_v = projection_v.to(device=org_weight_v.device, dtype=org_weight_v.dtype)
+
+        self.q_proj = ori_layer.q_proj
+        self.k_proj_low = torch.nn.Linear(self.hidden_size, self.rank_kq, bias=bias)
+        self.v_proj_low = torch.nn.Linear(self.hidden_size, self.rank_v, bias=bias)
+
+        self.k_proj_low.weight.data = torch.matmul(projection_k.t(), org_weight_k).contiguous()
+        self.v_proj_low.weight.data = torch.matmul(projection_v.t(), org_weight_v).contiguous()
+        if bias:
+            self.k_proj_low.bias.data = torch.matmul(projection_k.t(), org_bias_k).contiguous()
+            self.v_proj_low.bias.data = torch.matmul(projection_v.t(), org_bias_v).contiguous()
+
+        k_up = []
+        v_heads = []
+        for i in range(self.num_key_value_heads):
+            row_slice = slice(i * self.head_dim, (i + 1) * self.head_dim)
+            k_col_slice = slice(i * k_per_head, (i + 1) * k_per_head)
+            v_col_slice = slice(i * v_per_head, (i + 1) * v_per_head)
+            k_up.append(projection_k[row_slice, k_col_slice])
+            v_heads.append(projection_v[row_slice, v_col_slice])
+        self.k_proj_up_weight = nn.Parameter(torch.stack(k_up, dim=0).contiguous(), requires_grad=False)
+
+        self.o_proj_up = torch.nn.Linear(self.num_heads * v_per_head, self.hidden_size, bias=org_bias_out is not None)
+        for i in range(self.num_key_value_heads):
+            v_factor = v_heads[i]
+            for j in range(self.num_key_value_groups):
+                idx = i * self.num_key_value_groups + j
+                self.o_proj_up.weight.data[:, idx * v_per_head:(idx + 1) * v_per_head] = torch.matmul(
+                    org_weight_out[:, self.head_dim * idx:(idx + 1) * self.head_dim],
+                    v_factor,
+                )
+        if org_bias_out is not None:
+            self.o_proj_up.bias.data = org_bias_out.data.clone()
+
+        self._init_rope()
+
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def _apply_k_proj_up(self, key_states_low: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("bhsr,hdr->bhsd", key_states_low, self.k_proj_up_weight)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states_low = self.k_proj_low(hidden_states)
+        value_states_low = self.v_proj_low(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states_low = key_states_low.view(
+            bsz, q_len, self.num_key_value_heads, self.rank_kq // self.num_key_value_heads
+        ).transpose(1, 2)
+        value_states_low = value_states_low.view(
+            bsz, q_len, self.num_key_value_heads, self.rank_v // self.num_key_value_heads
+        ).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states_low, position_ids)
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states_low, value_states_low = past_key_value.update(
+                key_states_low, value_states_low, self.layer_idx, cache_kwargs
+            )
+
+        key_states = self._apply_k_proj_up(key_states_low)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states_low = repeat_kv(value_states_low, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states_low)
+
+        v_per_head = self.rank_v // self.num_key_value_heads
+        if attn_output.size() != (bsz, self.num_heads, q_len, v_per_head):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, v_per_head)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * v_per_head)
+        attn_output = self.o_proj_up(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
+class LlamaTuckerAttnDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        ori_layer,
+        args,
+        tucker_config,
+        config: LlamaConfig,
+        layer_idx: int,
+    ):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = LlamaTuckerAttention(
+            ori_layer.self_attn,
+            projection_k=tucker_config["k"]["projection"],
+            projection_v=tucker_config["v"]["projection"],
+            config=config,
+            layer_idx=layer_idx,
+        )
+        self.tucker_config = tucker_config
+        self.mlp = ori_layer.mlp
+        self.input_layernorm = ori_layer.input_layernorm
+        self.post_attention_layernorm = ori_layer.post_attention_layernorm
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
+        return outputs
+
+
 class LlamaEigenAttnDecoderLayer(nn.Module):
     def __init__(self, 
                  ori_layer,

@@ -1,7 +1,6 @@
-import transformers
 import torch
 from .models_utils import BaseLM, find_layers
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, BitsAndBytesConfig
 import torch.nn.functional as F
 from torch import nn
 import torch
@@ -11,6 +10,7 @@ from models.modelling_opt_eigen_attn import OPTForCausalLM_EigenAttn
 from models.modelling_opt_tucker_attn import OPTForCausalLM_TuckerAttn
 from models.modelling_mpt_eigen_attn import MptForCausalLM_EigenAttn
 from models.modelling_llama_eigen_attn import LlamaForCausalLM_EigenAttn
+from models.modelling_llama_tucker_attn import LlamaForCausalLM_TuckerAttn
 import os
 from typing import List, Optional, Tuple, Union
 from lm_eval.models.utils import (
@@ -23,6 +23,54 @@ from lm_eval.models.utils import (
 from peft import PeftModel
 
 
+def _dtype_from_name(name):
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        return torch.bfloat16
+    if name == "float32":
+        return torch.float32
+    raise ValueError(f"Unsupported dtype name: {name}")
+
+
+def _is_quantized_args(args):
+    return bool(getattr(args, "load_in_4bit", False) or getattr(args, "load_in_8bit", False))
+
+
+def _model_load_kwargs(args):
+    if getattr(args, "load_in_4bit", False) and getattr(args, "load_in_8bit", False):
+        raise ValueError("Choose only one of --load_in_4bit or --load_in_8bit")
+
+    if getattr(args, "load_in_4bit", False):
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=getattr(args, "bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_compute_dtype=_dtype_from_name(getattr(args, "bnb_4bit_compute_dtype", "float16")),
+            bnb_4bit_use_double_quant=bool(getattr(args, "bnb_4bit_use_double_quant", False)),
+        )
+        return {
+            "device_map": getattr(args, "quant_device_map", "auto"),
+            "torch_dtype": _dtype_from_name(getattr(args, "bnb_4bit_compute_dtype", "float16")),
+            "quantization_config": quantization_config,
+            "cache_dir": args.cache_dir,
+        }
+
+    if getattr(args, "load_in_8bit", False):
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        return {
+            "device_map": getattr(args, "quant_device_map", "auto"),
+            "torch_dtype": torch.float16,
+            "quantization_config": quantization_config,
+            "cache_dir": args.cache_dir,
+        }
+
+    return {
+        "device_map": "cpu",
+        "torch_dtype": torch.float16,
+        "cache_dir": args.cache_dir,
+    }
+
+
 class LMClass(BaseLM):
     def __init__(self, args):
 
@@ -30,6 +78,7 @@ class LMClass(BaseLM):
         self._rank = 0
         self._world_size = 1
         self.args = args
+        self.is_quantized = _is_quantized_args(args)
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = args.model
         self.batch_size_per_gpu = args.batch_size
@@ -45,10 +94,11 @@ class LMClass(BaseLM):
             use_fast = True
         
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=use_fast,legacy=False, cache_dir = args.cache_dir)
+        model_load_kwargs = _model_load_kwargs(args)
         if args.load_low_rank :
             low_rank_config = torch.load(os.path.join(args.save_dir,'low_rank_config.pt'))
             if 'mpt' in args.net.lower():
-                self.model = MptForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+                self.model = MptForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
                 if args.load_peft_model:
                     self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
                     
@@ -60,21 +110,30 @@ class LMClass(BaseLM):
                     low_rank_type = "tucker" if getattr(args, "use_tucker_attn", False) else "eigen"
 
                 if low_rank_type == "tucker":
-                    self.model = OPTForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+                    self.model = OPTForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, **model_load_kwargs)
                 else:
-                    self.model = OPTForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+                    self.model = OPTForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config = low_rank_config, **model_load_kwargs)
                 if args.load_peft_model:
                     self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
 
             elif 'llama' in args.net.lower():
-                self.model = LlamaForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+                low_rank_type_path = os.path.join(args.save_dir, 'low_rank_type.pt')
+                if os.path.exists(low_rank_type_path):
+                    low_rank_type = torch.load(low_rank_type_path)
+                else:
+                    low_rank_type = "tucker" if getattr(args, "use_tucker_attn", False) else "eigen"
+
+                if low_rank_type == "tucker":
+                    self.model = LlamaForCausalLM_TuckerAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
+                else:
+                    self.model = LlamaForCausalLM_EigenAttn.from_pretrained(args.save_dir, config=config, low_rank_config=low_rank_config, **model_load_kwargs)
                 if args.load_peft_model:
                     self.model = PeftModel.from_pretrained(self.model, args.peft_model_path)
                     self.model = self.model.model
             else:
                 raise NotImplementedError
         else:
-            self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16, cache_dir=args.cache_dir)
+            self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, **model_load_kwargs)
         if 'mpt' in args.net.lower():
             self.seqlen = self.model.config.max_seq_len
         else:

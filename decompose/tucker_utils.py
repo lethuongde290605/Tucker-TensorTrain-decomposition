@@ -666,6 +666,38 @@ def resolve_tucker_modes_for_opt(cfg: dict, num_heads: int) -> dict:
     return cfg
 
 
+def resolve_tucker_modes_for_llama(cfg: dict, num_key_value_heads: int) -> dict:
+    """
+    Keep the LLaMA KV-head mode uncompressed by default.
+
+    Tucker LLaMA compresses K/V projections only. Their feature dimension is
+    num_key_value_heads * head_dim, so preserving heads means reshaping as
+    (tokens, num_key_value_heads, ...head_dim factors) and decomposing only the
+    per-head feature modes.
+    """
+    cfg = cfg.copy()
+    if not cfg.get("preserve_heads", True):
+        raise ValueError("LLaMA Tucker requires preserve_heads=True because RoPE is applied per KV head")
+    if cfg.get("modes_were_explicit", False) and 1 in cfg["modes"]:
+        raise ValueError("LLaMA Tucker cannot decompose the KV-head mode; remove mode 1 from tucker modes")
+    if len(cfg["factor_dims"]) < 2:
+        raise ValueError(f"LLaMA Tucker requires at least 2 factor dims, got {cfg['factor_dims']}")
+
+    if cfg["factor_dims"][0] != int(num_key_value_heads):
+        kv_dim = math.prod(cfg["factor_dims"])
+        if kv_dim % int(num_key_value_heads) != 0:
+            raise ValueError(
+                f"Cannot preserve LLaMA KV heads for factor_dims={cfg['factor_dims']} "
+                f"and num_key_value_heads={num_key_value_heads}"
+            )
+        head_dim = kv_dim // int(num_key_value_heads)
+        cfg["factor_dims"] = [int(num_key_value_heads)] + factorize_dim(head_dim, len(cfg["factor_dims"]) - 1)
+
+    if not cfg.get("modes_were_explicit", False):
+        cfg["modes"] = list(range(2, len(cfg["factor_dims"]) + 1))
+    return cfg
+
+
 def _candidate_ranks_at_least(
     dims: list[int],
     min_ranks: list[int],
@@ -1140,9 +1172,84 @@ def build_opt_tucker_projection_config(
     }
 
 
+@torch.no_grad()
+def get_llama_tucker_activations(layer, fp_inps, args, attention_mask, position_ids):
+    from decompose.eigen_attn_utils import get_kqv_llama
+
+    tensor_k, tensor_q, tensor_v = get_kqv_llama(layer, fp_inps, args, attention_mask, position_ids)
+    return tensor_k, tensor_q, tensor_v
+
+
+def build_llama_tucker_projection_config(
+    tensor_k: torch.Tensor,
+    tensor_q: torch.Tensor,
+    tensor_v: torch.Tensor,
+    args,
+    num_key_value_heads: int,
+    threshold: float,
+) -> dict:
+    kv_dim = int(tensor_k.shape[-1])
+    if int(tensor_v.shape[-1]) != kv_dim:
+        raise ValueError(f"Expected LLaMA K/V dims to match, got K={tensor_k.shape[-1]} V={tensor_v.shape[-1]}")
+
+    cfg = get_tucker_attn_config(args, kv_dim)
+    cfg = resolve_tucker_modes_for_llama(cfg, num_key_value_heads)
+
+    flat_k = tensor_k.reshape(-1, kv_dim)
+    flat_v = tensor_v.reshape(-1, kv_dim)
+
+    k = build_headwise_tucker_projection_from_tensor(
+        flat_k,
+        cfg["factor_dims"],
+        cfg["modes"],
+        threshold,
+        num_key_value_heads,
+        manual_ranks=cfg["manual_ranks_kq"],
+        log_reconstruction_error=cfg["log_reconstruction_error"],
+    )
+    v = build_headwise_tucker_projection_from_tensor(
+        flat_v,
+        cfg["factor_dims"],
+        cfg["modes"],
+        threshold,
+        num_key_value_heads,
+        manual_ranks=cfg["manual_ranks_v"],
+        log_reconstruction_error=cfg["log_reconstruction_error"],
+    )
+
+    return {
+        "threshold": float(threshold),
+        "factor_dims": cfg["factor_dims"],
+        "modes": cfg["modes"],
+        "headwise": True,
+        "qk": k,
+        "k": k,
+        "v": v,
+    }
+
+
 def tucker_attention_param_ratio(embed_dim: int, qk_latent_dim: int, v_latent_dim: int) -> float:
     original = 4 * embed_dim * embed_dim
     compressed = (2 * qk_latent_dim * embed_dim) + (2 * v_latent_dim * embed_dim)
+    return compressed / original
+
+
+def llama_tucker_attention_param_ratio(
+    hidden_size: int,
+    kv_dim: int,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    k_latent_dim: int,
+    v_latent_dim: int,
+) -> float:
+    original = (2 * hidden_size * hidden_size) + (2 * hidden_size * kv_dim)
+    k_per_kv_head = k_latent_dim // num_key_value_heads
+    v_per_kv_head = v_latent_dim // num_key_value_heads
+    compressed = hidden_size * hidden_size
+    compressed += hidden_size * k_latent_dim
+    compressed += num_key_value_heads * kv_dim // num_key_value_heads * k_per_kv_head
+    compressed += hidden_size * v_latent_dim
+    compressed += hidden_size * (num_attention_heads * v_per_kv_head)
     return compressed / original
 
 
