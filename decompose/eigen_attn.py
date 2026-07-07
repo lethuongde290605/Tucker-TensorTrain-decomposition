@@ -91,6 +91,8 @@ def eigenattn(
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
+        if hasattr(model.model, "rotary_emb"):
+            model.model.rotary_emb = model.model.rotary_emb.to(dev)
         DecoderLayer = LlamaEigenAttnDecoderLayer
         
     elif "opt" in args.net.lower():
@@ -135,7 +137,9 @@ def eigenattn(
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
             if self.is_llama:
-                cache["position_ids"] = kwargs["position_ids"]
+                cache["position_ids"] = kwargs.get("position_ids", None)
+                if "position_embeddings" in kwargs:
+                    cache["position_embeddings"] = kwargs["position_embeddings"]
             if self.is_mpt :
                 cache["position_bias"] = kwargs["position_bias"]
             raise ValueError
@@ -159,6 +163,8 @@ def eigenattn(
     if is_llama :
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
+        if hasattr(model.model, "rotary_emb"):
+            model.model.rotary_emb = model.model.rotary_emb.cpu()
     elif is_opt:
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
         model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
