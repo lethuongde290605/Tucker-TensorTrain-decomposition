@@ -46,6 +46,73 @@ def _use_tucker_attention(args) -> bool:
     return bool(tucker_params.get("enabled", tucker_params.get("use_tucker", False)))
 
 
+def _use_quantized_model(args) -> bool:
+    return bool(getattr(args, "load_in_4bit", False) or getattr(args, "load_in_8bit", False))
+
+
+def _module_device(module, fallback):
+    for param in module.parameters(recurse=True):
+        return param.device
+    for buffer in module.buffers(recurse=True):
+        return buffer.device
+    return torch.device(fallback)
+
+
+def _dequantize_weight(weight):
+    if hasattr(weight, "dequantize"):
+        try:
+            return weight.dequantize()
+        except Exception:
+            pass
+    data = getattr(weight, "data", weight)
+    if hasattr(data, "dequantize"):
+        try:
+            return data.dequantize()
+        except Exception:
+            pass
+    return weight.detach()
+
+
+def _clone_as_fp_linear(module, device, dtype=torch.float16):
+    weight = _dequantize_weight(module.weight).to(device=device, dtype=dtype).contiguous()
+    bias = getattr(module, "bias", None)
+    linear = nn.Linear(
+        weight.shape[1],
+        weight.shape[0],
+        bias=bias is not None,
+        device=device,
+        dtype=dtype,
+    )
+    linear.weight.data.copy_(weight)
+    if bias is not None:
+        linear.bias.data.copy_(bias.detach().to(device=device, dtype=dtype))
+    return linear
+
+
+class _TemporaryDequantizedLlamaAttention:
+    def __init__(self, layer, device, dtype=torch.float16):
+        self.layer = layer
+        self.device = device
+        self.dtype = dtype
+        self.attn = layer.self_attn
+        self.names = ("q_proj", "k_proj", "v_proj", "o_proj")
+        self.originals = {}
+
+    def __enter__(self):
+        for name in self.names:
+            module = getattr(self.attn, name)
+            self.originals[name] = module
+            setattr(self.attn, name, _clone_as_fp_linear(module, self.device, self.dtype))
+        return self.layer
+
+    def __exit__(self, exc_type, exc, traceback):
+        for name, module in self.originals.items():
+            setattr(self.attn, name, module)
+        self.originals.clear()
+        torch.cuda.empty_cache()
+        return False
+
+
 def _log_tucker_candidate(logger, layer_id, tucker_config, output_error, compression_ratio, memory_mb):
     qk = tucker_config["qk"]
     v = tucker_config["v"]
@@ -80,6 +147,7 @@ def eigenattn(
     # move embedding layer and first layer to target device
     model = lm.model
     dev = lm.device
+    is_quantized = _use_quantized_model(args)
     use_cache = model.config.use_cache
     model.config.use_cache = False
     is_llama = False
@@ -89,8 +157,9 @@ def eigenattn(
     if "llama" in args.net.lower() :
         is_llama = True
         layers = model.model.layers
-        model.model.embed_tokens = model.model.embed_tokens.to(dev)
-        model.model.norm = model.model.norm.to(dev)
+        if not is_quantized:
+            model.model.embed_tokens = model.model.embed_tokens.to(dev)
+            model.model.norm = model.model.norm.to(dev)
         if hasattr(model.model, "rotary_emb"):
             model.model.rotary_emb = model.model.rotary_emb.to(dev)
         DecoderLayer = LlamaEigenAttnDecoderLayer
@@ -117,7 +186,8 @@ def eigenattn(
         raise ValueError("Only support for opt/mpt/llama-2/llama-3.0 now")
     
     
-    layers[0] = layers[0].to(dev)
+    if not is_quantized:
+        layers[0] = layers[0].to(dev)
     dtype = torch.float16
     inps = torch.zeros(
         (args.nsamples, lm.seqlen, model.config.hidden_size), dtype=dtype, device=dev
@@ -159,11 +229,13 @@ def eigenattn(
     
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
-    layers[0] = layers[0].cpu()
+    if not is_quantized:
+        layers[0] = layers[0].cpu()
     if is_llama :
-        model.model.embed_tokens = model.model.embed_tokens.cpu()
-        model.model.norm = model.model.norm.cpu()
-        if hasattr(model.model, "rotary_emb"):
+        if not is_quantized:
+            model.model.embed_tokens = model.model.embed_tokens.cpu()
+            model.model.norm = model.model.norm.cpu()
+        if not is_quantized and hasattr(model.model, "rotary_emb"):
             model.model.rotary_emb = model.model.rotary_emb.cpu()
     elif is_opt:
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
@@ -197,7 +269,7 @@ def eigenattn(
 
 
     for i in range(len(layers)):
-        layer = layers[i].to(dev)
+        layer = layers[i] if is_quantized else layers[i].to(dev)
 
         if is_opt:
             with torch.no_grad():
@@ -431,6 +503,16 @@ def eigenattn(
         elif is_llama:
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
+                    llama_attention_context = None
+                    if is_quantized and _use_tucker_attention(args):
+                        layer_device = _module_device(layer, dev)
+                        logger.info(
+                            f"layer {i} temporarily dequantizing LLaMA attention projections "
+                            f"on {layer_device} for Tucker decomposition"
+                        )
+                        llama_attention_context = _TemporaryDequantizedLlamaAttention(layer, layer_device, dtype)
+                        layer = llama_attention_context.__enter__()
+
                     output_hr = torch.stack([layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids = position_ids, layer_idx = i)[0] for j in range(args.nsamples)])
 
                     if _use_tucker_attention(args):
@@ -474,7 +556,9 @@ def eigenattn(
                                 candidate_config,
                                 lm.model.config,
                                 i,
-                            ).to(dev)
+                            )
+                            if not is_quantized:
+                                qlayer_candidate = qlayer_candidate.to(dev)
                             output_lr = torch.stack([
                                 qlayer_candidate(
                                     inps[j].unsqueeze(0),
@@ -550,7 +634,9 @@ def eigenattn(
                                 best_config = full_config
                                 best_error = error
                                 best_threshold = 1.0
-                                qlayer = LlamaTuckerAttnDecoderLayer(layer, args, best_config, lm.model.config, i).to(dev)
+                                qlayer = LlamaTuckerAttnDecoderLayer(layer, args, best_config, lm.model.config, i)
+                                if not is_quantized:
+                                    qlayer = qlayer.to(dev)
                             else:
                                 logger.info(
                                     f"layer {i} full LLaMA Tucker output_error:{error} still exceeds "
@@ -562,7 +648,9 @@ def eigenattn(
                                 del full_config
                             torch.cuda.empty_cache()
                         else:
-                            qlayer = LlamaTuckerAttnDecoderLayer(layer, args, best_config, lm.model.config, i).to(dev)
+                            qlayer = LlamaTuckerAttnDecoderLayer(layer, args, best_config, lm.model.config, i)
+                            if not is_quantized:
+                                qlayer = qlayer.to(dev)
                             error = best_error
 
                         if best_config is not None:
@@ -585,6 +673,10 @@ def eigenattn(
                             )
                         else:
                             logger.info(f"layer {i} selected original decoder layer output_error:0.0")
+
+                        if llama_attention_context is not None:
+                            llama_attention_context.__exit__(None, None, None)
+                            llama_attention_context = None
 
                         del tensor_k, tensor_q, tensor_v, output_hr
                         torch.cuda.empty_cache()
@@ -641,9 +733,11 @@ def eigenattn(
         
     
 
-        qlayer.half() 
-
-        layers[i] = qlayer.to("cpu")
+        if is_quantized:
+            layers[i] = qlayer
+        else:
+            qlayer.half()
+            layers[i] = qlayer.to("cpu")
         del layer
         torch.cuda.empty_cache()
 

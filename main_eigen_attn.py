@@ -328,10 +328,15 @@ def main():
     args = parser.parse_args()
     if args.load_in_4bit and args.load_in_8bit:
         raise ValueError("Choose only one of --load_in_4bit or --load_in_8bit")
-    if (args.load_in_4bit or args.load_in_8bit) and not (args.load_low_rank or args.evaluate_baseline):
+    model_name_for_guard = args.net or args.model
+    quantized_decompose_supported = "llama" in model_name_for_guard.lower() and args.use_tucker_attn
+    if (args.load_in_4bit or args.load_in_8bit) and not (
+        args.load_low_rank or args.evaluate_baseline or quantized_decompose_supported
+    ):
         raise ValueError(
-            "Quantized loading is currently supported for --evaluate_baseline or --load_low_rank evaluation. "
-            "Run decomposition without quantization, then reload the saved low-rank model with --load_low_rank --load_in_4bit."
+            "Quantized decomposition is currently supported only for LLaMA Tucker attention. "
+            "Use --use_tucker_attn with a LLaMA model, or use quantization only with "
+            "--evaluate_baseline / --load_low_rank."
         )
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -392,6 +397,7 @@ def main():
 
     logger.info("=== start low rank decomposition ===")
     tick = time.time()     
+    is_quantized = bool(getattr(args, "load_in_4bit", False) or getattr(args, "load_in_8bit", False))
     # load calibration dataset
     cache_dataloader = f'{args.cache_dir}/dataloader_{args.model_family}_{args.calib_dataset}_{args.nsamples}.cache'
     if os.path.exists(cache_dataloader):
@@ -503,6 +509,25 @@ def main():
             low_rank_config = []
             for i in range(len(layers)):
                 low_rank_config.append([int(layers[i].self_attn.rank_kq), int(layers[i].self_attn.rank_v)])
+
+            if is_quantized and args.use_tucker_attn and not args.load_low_rank:
+                logger.info(
+                    "Quantized LLaMA Tucker decomposition finished; skipping fp16 CPU rebuild "
+                    "and keeping the compressed in-memory model."
+                )
+                if args.save_dir:
+                    lm.model.save_pretrained(args.save_dir)
+                    lm.tokenizer.save_pretrained(args.save_dir)
+                    torch.save(low_rank_config, os.path.join(args.save_dir,'low_rank_config.pt'))
+                    torch.save("tucker", os.path.join(args.save_dir,'low_rank_type.pt'))
+                logger.info(time.time() - tick)
+                logger.info("=== Evaluating compressed model ===")
+                model_params, _ = get_model_size(lm)
+                logger.info(f"Compressed model parameters : {model_params/1000000000} Billion")
+                cache_size = get_kvcache_size_llama(lm)
+                logger.info(f"Compressed model KV Cache Size : {cache_size} GB for batch size of 1")
+                evaluate(lm, args,logger)
+                return
             
             config = AutoConfig.from_pretrained(args.model, attn_implementation=args.attn_implementation, cache_dir = args.cache_dir)
             if args.use_tucker_attn:
