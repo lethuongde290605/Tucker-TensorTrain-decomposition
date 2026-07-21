@@ -1172,6 +1172,10 @@ class LlamaTuckerAttention(nn.Module):
     def _apply_k_proj_up(self, key_states_low: torch.Tensor) -> torch.Tensor:
         return torch.einsum("bhsr,hdr->bhsd", key_states_low, self.k_proj_up_weight)
 
+    def _ensure_output_projection_dtype(self, dtype: torch.dtype, device: torch.device) -> None:
+        if self.o_proj_up.weight.dtype != dtype or self.o_proj_up.weight.device != device:
+            self.o_proj_up = self.o_proj_up.to(device=device, dtype=dtype)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1229,6 +1233,7 @@ class LlamaTuckerAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * v_per_head)
+        self._ensure_output_projection_dtype(attn_output.dtype, attn_output.device)
         attn_output = self.o_proj_up(attn_output)
 
         if not output_attentions:
